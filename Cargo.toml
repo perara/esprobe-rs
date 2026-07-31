@@ -1,6 +1,10 @@
 [workspace]
 resolver = "3"
 members = ["crates/esprobe", "crates/esprobe-protocol"]
+# The firmware is a separate workspace: it cross-compiles for
+# riscv32imc-esp-espidf with its own toolchain and build-std settings, which a
+# host-side `cargo build` at the root must not try to apply.
+exclude = ["crates/esprobe-firmware"]
 
 [workspace.package]
 version = "0.1.0"
