@@ -82,13 +82,12 @@ cp wifi.env.example .env.local
 # Set the local password in .env.local. Never commit it.
 ./scripts/build.sh
 espflash flash --monitor \
-  target/riscv32imc-esp-espidf/release/ir-control-hub-esp32c3
+  target/riscv32imc-esp-espidf/release/esprobe-firmware
 ```
 
-The provided local checkout already has `.env.local` configured for the
-requested `Newbringer` and `Spikkelia-28` networks and the `IR-Control-Hub`
-SoftAP. Credentials are ignored by Git. `WIFI_SSID_FALLBACK` and
-`WIFI_PASSWORD_FALLBACK` are optional.
+`.env.local` is ignored by Git and is the only place credentials belong.
+`WIFI_SSID_FALLBACK` and `WIFI_PASSWORD_FALLBACK` are optional; a second
+network is useful when the bridge moves between benches.
 
 The SoftAP uses the ESP-IDF default address `192.168.71.1` and stays available
 while infrastructure association is retried. Configure its SSID and WPA2
