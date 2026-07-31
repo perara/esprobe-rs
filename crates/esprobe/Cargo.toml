@@ -13,5 +13,6 @@ ctrlc = "3.4"
 esprobe-protocol = { path = "../esprobe-protocol" }
 probe-rs = "0.31"
 serialport = { version = "4.8", default-features = false }
+rpassword = "7.3"
 sha2 = "0.10"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

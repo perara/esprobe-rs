@@ -13,6 +13,7 @@ mod spi_wire;
 
 #[cfg(target_os = "espidf")]
 mod app {
+    use std::net::Ipv4Addr;
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::Duration;
@@ -22,6 +23,7 @@ mod app {
     use embedded_svc::io::{Read as _, Write as _};
     use embedded_svc::wifi::{
         AccessPointConfiguration, AuthMethod, ClientConfiguration, Configuration, PmfConfiguration,
+        ScanMethod, ScanSortMethod,
     };
     use esp_idf_svc::eventloop::EspSystemEventLoop;
     use esp_idf_svc::hal::delay::Ets;
@@ -49,16 +51,24 @@ mod app {
         Command as BridgeCommand, MAX_BLOCK_WORDS, MAX_FRAME as BRIDGE_MAX_FRAME,
         Status as BridgeStatus, decode_request, encode_response,
     };
-    use esprobe_firmware::{ProgrammingTarget, pinmap};
+    use esprobe_firmware::{ProgrammingTarget, pinmap, wifi_credentials};
 
     use crate::hardware::{Engine, EspSwdIo, cpu_cycles};
 
-    const WIFI_SSID: &str = env!("WIFI_SSID");
-    const WIFI_PASSWORD: &str = env!("WIFI_PASSWORD");
+    // Build-time credentials are a convenience for a bench that always joins
+    // the same network, not a requirement: an image with none still builds,
+    // still bridges over USB, and can be given a network at runtime.
+    const WIFI_SSID: Option<&str> = option_env!("WIFI_SSID");
+    const WIFI_PASSWORD: Option<&str> = option_env!("WIFI_PASSWORD");
     const WIFI_SSID_FALLBACK: Option<&str> = option_env!("WIFI_SSID_FALLBACK");
     const WIFI_PASSWORD_FALLBACK: Option<&str> = option_env!("WIFI_PASSWORD_FALLBACK");
-    const CONTROL_AP_SSID: &str = env!("CONTROL_AP_SSID");
-    const CONTROL_AP_PASSWORD: &str = env!("CONTROL_AP_PASSWORD");
+    const CONTROL_AP_SSID: Option<&str> = option_env!("CONTROL_AP_SSID");
+    const CONTROL_AP_PASSWORD: Option<&str> = option_env!("CONTROL_AP_PASSWORD");
+    /// Where runtime credentials live, so a network change costs a command
+    /// rather than a rebuild and a reflash.
+    const NVS_NAMESPACE: &str = "esprobe";
+    const NVS_SSID: &str = "sta_ssid";
+    const NVS_PASSWORD: &str = "sta_pass";
     const MAX_DISPLAY_FRAME: usize = 1024;
     /// Set when the bench harness has SWDIO and SWCLK crossed. The bridge's
     /// `SetPinMap` command overrides this at runtime.
@@ -69,6 +79,21 @@ mod app {
     /// Port the bridge protocol is served on over the network.
     const BRIDGE_TCP_PORT: u16 = 3333;
 
+    /// What the bridge knows about the radio, and what it wants changed.
+    ///
+    /// The radio is owned by the main loop; the bridge only ever leaves a
+    /// request here and reads back the last published snapshot. Sharing the
+    /// driver itself would put a Wi-Fi reconnect — seconds of it — inside a
+    /// command that the host is waiting on.
+    #[derive(Default)]
+    struct WifiControl {
+        pending: Option<(String, String)>,
+        forget: bool,
+        connected: bool,
+        ip: [u8; 4],
+        ssid: String,
+    }
+
     struct Hub {
         asw_s0: PinDriver<'static, InputOutput>,
         asw_s1: PinDriver<'static, InputOutput>,
@@ -76,6 +101,7 @@ mod app {
         display: UartDriver<'static>,
         swd: Option<SwdLink<EspSwdIo<'static>>>,
         selected: ProgrammingTarget,
+        wifi: Arc<Mutex<WifiControl>>,
         bridge_attached: bool,
         /// Whether *this* firmware is holding the shared reset line down.
         ///
@@ -824,6 +850,35 @@ mod app {
                     // makes it a measurement of the transport alone.
                     Ok(0)
                 }
+                BridgeCommand::WifiStatus => {
+                    let wifi = self.wifi.lock().map_err(|_| SwdError::Protocol(0))?;
+                    response[0] = u8::from(wifi.connected);
+                    response[1..5].copy_from_slice(&wifi.ip);
+                    let ssid = wifi.ssid.as_bytes();
+                    let length = ssid.len().min(response.len() - 6);
+                    response[5] = length as u8;
+                    response[6..6 + length].copy_from_slice(&ssid[..length]);
+                    Ok(6 + length)
+                }
+                BridgeCommand::WifiSet => {
+                    let (ssid, password) =
+                        wifi_credentials::decode(payload).ok_or(SwdError::Protocol(1))?;
+                    // Stored before it is tried: a credential that only lives
+                    // in RAM is one power cycle from being lost, and the point
+                    // is to not have to say it twice.
+                    store_wifi_credentials(ssid, password).map_err(|_| SwdError::Protocol(2))?;
+                    let mut wifi = self.wifi.lock().map_err(|_| SwdError::Protocol(3))?;
+                    wifi.pending = Some((ssid.to_string(), password.to_string()));
+                    wifi.forget = false;
+                    Ok(0)
+                }
+                BridgeCommand::WifiForget => {
+                    forget_wifi_credentials().map_err(|_| SwdError::Protocol(2))?;
+                    let mut wifi = self.wifi.lock().map_err(|_| SwdError::Protocol(0))?;
+                    wifi.pending = None;
+                    wifi.forget = true;
+                    Ok(0)
+                }
                 BridgeCommand::PinMap => {
                     // Which board this firmware was built for. Worth a command
                     // of its own: a mismatch is not a wrong answer, it is two
@@ -1062,6 +1117,75 @@ mod app {
         }
     }
 
+    /// The default NVS partition, taken once.
+    ///
+    /// `take` is a one-shot: the radio needs the partition too, so a second
+    /// call fails. Handing out clones of the first one is the only way both
+    /// the credential store and Wi-Fi can have it.
+    static NVS_PARTITION: Mutex<Option<EspDefaultNvsPartition>> = Mutex::new(None);
+
+    fn nvs_partition() -> Result<EspDefaultNvsPartition> {
+        let mut slot = NVS_PARTITION
+            .lock()
+            .map_err(|_| anyhow::anyhow!("the NVS partition lock is poisoned"))?;
+        if slot.is_none() {
+            *slot = Some(EspDefaultNvsPartition::take()?);
+        }
+        Ok(slot.as_ref().expect("just populated").clone())
+    }
+
+    /// Opens the store credentials live in.
+    fn credential_store() -> Result<esp_idf_svc::nvs::EspDefaultNvs> {
+        Ok(esp_idf_svc::nvs::EspNvs::new(
+            nvs_partition()?,
+            NVS_NAMESPACE,
+            true,
+        )?)
+    }
+
+    fn store_wifi_credentials(ssid: &str, password: &str) -> Result<()> {
+        let mut store = credential_store()?;
+        store.set_str(NVS_SSID, ssid)?;
+        store.set_str(NVS_PASSWORD, password)?;
+        Ok(())
+    }
+
+    fn forget_wifi_credentials() -> Result<()> {
+        let mut store = credential_store()?;
+        // Absent keys are not an error: forgetting twice should succeed.
+        let _ = store.remove(NVS_SSID);
+        let _ = store.remove(NVS_PASSWORD);
+        Ok(())
+    }
+
+    /// Credentials from storage, falling back to any compiled into the image.
+    ///
+    /// Storage wins, so a provisioned network is not silently overridden by
+    /// whatever the image happened to be built with.
+    fn load_wifi_credentials() -> Option<(String, String)> {
+        let mut store = credential_store().ok()?;
+        let mut ssid = [0u8; wifi_credentials::MAX_SSID + 1];
+        let mut password = [0u8; wifi_credentials::MAX_PASSWORD + 1];
+        let stored = store
+            .get_str(NVS_SSID, &mut ssid)
+            .ok()
+            .flatten()
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string());
+        if let Some(ssid) = stored {
+            let password = store
+                .get_str(NVS_PASSWORD, &mut password)
+                .ok()
+                .flatten()
+                .unwrap_or("")
+                .to_string();
+            return Some((ssid, password));
+        }
+        WIFI_SSID
+            .zip(WIFI_PASSWORD)
+            .map(|(ssid, password)| (ssid.to_string(), password.to_string()))
+    }
+
     /// Every GPIO the chip has, indexed by its number.
     ///
     /// `Pins` names each pad as a distinct type, which is exactly wrong for a
@@ -1112,7 +1236,7 @@ mod app {
 
         let peripherals = Peripherals::take()?;
         let sys_loop = EspSystemEventLoop::take()?;
-        let nvs = EspDefaultNvsPartition::take()?;
+        let nvs = nvs_partition()?;
         for pin in pinmap::CLAIMED {
             Hub::reclaim_gpio(pin)?;
         }
@@ -1159,6 +1283,7 @@ mod app {
             SWD_PINS_SWAPPED,
         )?;
 
+        let wifi_control = Arc::new(Mutex::new(WifiControl::default()));
         let hub = Arc::new(Mutex::new(Hub {
             asw_s0,
             asw_s1,
@@ -1166,6 +1291,7 @@ mod app {
             display,
             swd: Some(SwdLink::new(swd)),
             selected: ProgrammingTarget::Stm32,
+            wifi: wifi_control.clone(),
             bridge_attached: false,
             reset_held: false,
         }));
@@ -1175,28 +1301,60 @@ mod app {
             EspWifi::new(peripherals.modem, sys_loop.clone(), Some(nvs))?,
             sys_loop,
         )?;
-        start_wifi(&mut wifi)?;
-        let ip = wifi.wifi().ap_netif().get_ip_info()?.ip;
-        info!("carrier board access point {CONTROL_AP_SSID} online at http://{ip}");
+        // The bridge is up on USB before the radio is touched: a board with no
+        // credentials is still a working probe, and is how the first ones get
+        // set. Wi-Fi failing must never take USB down with it.
+        match start_wifi(&mut wifi) {
+            Ok(()) => {
+                if let Ok(info) = wifi.wifi().ap_netif().get_ip_info() {
+                    info!("Access point online at {}", info.ip);
+                }
+            }
+            Err(error) => warn!("Wi-Fi did not start: {error}; the USB bridge is unaffected"),
+        }
 
         spawn_network_bridge(hub.clone())?;
 
         let mut server = EspHttpServer::new(&Default::default())?;
-        register_handlers(&mut server, hub, ip)?;
+        register_handlers(&mut server, hub, Ipv4Addr::UNSPECIFIED)?;
 
         loop {
-            thread::sleep(Duration::from_secs(5));
-            if !wifi.is_connected().unwrap_or(false) {
-                match associate_wifi(&mut wifi) {
-                    Ok(true) => match wifi.wifi().sta_netif().get_ip_info() {
-                        Ok(info) => {
-                            info!("carrier board station online at http://{}", info.ip);
-                        }
-                        Err(error) => warn!("Station connected but has no IP: {error}"),
-                    },
-                    Ok(false) => warn!("Infrastructure Wi-Fi pass failed; SoftAP remains online"),
-                    Err(error) => error!("Wi-Fi retry failed: {error}"),
+            thread::sleep(Duration::from_secs(2));
+
+            // Anything the host asked for since the last pass.
+            let (pending, forget) = match wifi_control.lock() {
+                Ok(mut control) => (control.pending.take(), std::mem::take(&mut control.forget)),
+                Err(_) => (None, false),
+            };
+            if forget {
+                info!("Wi-Fi credentials cleared; disconnecting");
+                let _ = wifi.disconnect();
+            }
+            if let Some((ssid, password)) = pending {
+                info!("Joining Wi-Fi {ssid} on request");
+                match join_wifi(&mut wifi, &ssid, &password) {
+                    Ok(true) => info!("Joined {ssid}"),
+                    Ok(false) => warn!("Could not join {ssid}"),
+                    Err(error) => warn!("Joining {ssid} failed: {error}"),
                 }
+            } else if !wifi.is_connected().unwrap_or(false)
+                && let Some((ssid, password)) = load_wifi_credentials()
+            {
+                let _ = join_wifi(&mut wifi, &ssid, &password);
+            }
+
+            // Publish what the host will see through `wifi status`.
+            if let Ok(mut control) = wifi_control.lock() {
+                control.connected = wifi.is_connected().unwrap_or(false);
+                control.ip = wifi
+                    .wifi()
+                    .sta_netif()
+                    .get_ip_info()
+                    .map(|info| info.ip.octets())
+                    .unwrap_or([0; 4]);
+                control.ssid = load_wifi_credentials()
+                    .map(|(ssid, _)| ssid)
+                    .unwrap_or_default();
             }
         }
     }
@@ -1377,92 +1535,68 @@ mod app {
         }
     }
 
+    /// Brings the radio up with whatever configuration is available.
+    ///
+    /// A station with no credentials is still worth starting: the access point
+    /// gives a way in, and the board can be given a network later without a
+    /// restart.
     fn start_wifi(wifi: &mut BlockingWifi<EspWifi<'static>>) -> Result<()> {
-        wifi.set_configuration(&Configuration::Mixed(
-            client_configuration(WIFI_SSID, WIFI_PASSWORD, None, None)?,
-            access_point_configuration()?,
-        ))?;
-        Ok(wifi.start()?)
+        let credentials = load_wifi_credentials();
+        apply_configuration(wifi, credentials.as_ref())?;
+        wifi.start()?;
+        Ok(())
     }
 
-    fn associate_wifi(wifi: &mut BlockingWifi<EspWifi<'static>>) -> Result<bool> {
-        let networks = [
-            Some((WIFI_SSID, WIFI_PASSWORD)),
-            WIFI_SSID_FALLBACK.zip(WIFI_PASSWORD_FALLBACK),
-        ];
-        match wifi.scan() {
-            Ok(mut access_points) => {
-                access_points
-                    .sort_by_key(|access_point| core::cmp::Reverse(access_point.signal_strength));
-                let mut found_configured_network = false;
-                for (ssid, password) in networks.into_iter().flatten() {
-                    let mut found_ssid = false;
-                    for access_point in access_points
-                        .iter()
-                        .filter(|access_point| access_point.ssid.as_str() == ssid)
-                    {
-                        found_ssid = true;
-                        found_configured_network = true;
-                        info!(
-                            "Visible Wi-Fi {ssid} bssid={:02x?} channel={} auth={:?} rssi={}",
-                            access_point.bssid,
-                            access_point.channel,
-                            access_point.auth_method,
-                            access_point.signal_strength
-                        );
-                        if try_wifi_candidate(
-                            wifi,
-                            ssid,
-                            password,
-                            Some(access_point.bssid),
-                            Some(access_point.channel),
-                        )? {
-                            return Ok(true);
-                        }
-                    }
-                    if found_ssid {
-                        info!("Trying Wi-Fi {ssid} without BSSID/channel pinning");
-                        if try_wifi_candidate(wifi, ssid, password, None, None)? {
-                            return Ok(true);
-                        }
-                    }
-                }
-                if !found_configured_network {
-                    warn!("None of the configured Wi-Fi networks were visible");
-                }
+    /// Programs the radio for one set of station credentials, or for none.
+    ///
+    /// The access point comes up only when there is no network to join. The two
+    /// cannot be had at once in any useful sense: one radio means the soft AP
+    /// drags the board onto its channel, and the log shows exactly that —
+    /// `ap channel adjust o:1,1 n:3,1` immediately before an authentication
+    /// that expires. Since provisioning now arrives over USB, the access point
+    /// is a fallback for an unprovisioned probe, not a permanent fixture.
+    fn apply_configuration(
+        wifi: &mut BlockingWifi<EspWifi<'static>>,
+        credentials: Option<&(String, String)>,
+    ) -> Result<()> {
+        let configuration = match credentials {
+            Some((ssid, password)) => {
+                Configuration::Client(client_configuration(ssid, password, None, None)?)
             }
-            Err(error) => {
-                warn!("Wi-Fi scan failed: {error}; trying unpinned profiles");
-                for (ssid, password) in networks.into_iter().flatten() {
-                    if try_wifi_candidate(wifi, ssid, password, None, None)? {
-                        return Ok(true);
-                    }
-                }
-            }
-        }
-        Ok(false)
+            None => match access_point_configuration()? {
+                Some(access_point) => Configuration::AccessPoint(access_point),
+                None => Configuration::Client(ClientConfiguration::default()),
+            },
+        };
+        wifi.set_configuration(&configuration)?;
+        Ok(())
     }
 
-    fn try_wifi_candidate(
+    /// Associates with one network, leaving the access point as it was.
+    fn join_wifi(
         wifi: &mut BlockingWifi<EspWifi<'static>>,
         ssid: &str,
         password: &str,
-        bssid: Option<[u8; 6]>,
-        channel: Option<u8>,
     ) -> Result<bool> {
         let _ = wifi.disconnect();
-        wifi.set_configuration(&Configuration::Mixed(
-            client_configuration(ssid, password, bssid, channel)?,
-            access_point_configuration()?,
-        ))?;
-        info!("Trying Wi-Fi {ssid} bssid={bssid:02x?} channel={channel:?}");
-        match wifi.connect().and_then(|_| wifi.wait_netif_up()) {
-            Ok(()) => {
-                info!("Wi-Fi associated with {ssid} bssid={bssid:02x?}");
-                Ok(true)
-            }
+        apply_configuration(wifi, Some(&(ssid.to_string(), password.to_string())))?;
+        if !wifi.is_started().unwrap_or(false) {
+            wifi.start()?;
+        }
+        match wifi.connect().and_then(|()| wifi.wait_netif_up()) {
+            Ok(()) => Ok(true),
             Err(error) => {
-                warn!("Wi-Fi association with {ssid} bssid={bssid:02x?} failed: {error}");
+                warn!("Association with {ssid} failed: {error}");
+                // Which access points actually answered, so a failure to join
+                // can be told apart from a failure to find.
+                if let Ok(seen) = wifi.scan() {
+                    for found in seen.iter().filter(|found| found.ssid.as_str() == ssid) {
+                        warn!(
+                            "  {ssid} at {:02x?}: channel {}, {} dBm, {:?}",
+                            found.bssid, found.channel, found.signal_strength, found.auth_method
+                        );
+                    }
+                }
                 Ok(false)
             }
         }
@@ -1481,24 +1615,38 @@ mod app {
                 .try_into()
                 .map_err(|_| anyhow!("Wi-Fi password too long"))?,
             channel,
-            auth_method: AuthMethod::WPA2Personal,
+            // A threshold, not a demand: naming WPA2 here refuses a WPA3-only
+            // or transition-mode access point before the passphrase is ever
+            // tried, which looks identical to a wrong password. `None` accepts
+            // whatever the access point actually offers.
+            auth_method: AuthMethod::None,
+            // A fast scan associates with the first access point answering to
+            // the name, which on a mesh or repeater network is whichever node
+            // replies quickest rather than the one that can hold a link. Scan
+            // every channel and take the strongest.
+            scan_method: ScanMethod::CompleteScan(ScanSortMethod::Signal),
             pmf_cfg: PmfConfiguration::Capable { required: false },
             ..Default::default()
         })
     }
 
-    fn access_point_configuration() -> Result<AccessPointConfiguration> {
-        Ok(AccessPointConfiguration {
-            ssid: CONTROL_AP_SSID
+    /// The access point, when the image was built with one.
+    ///
+    /// Optional on purpose: an unconfigured probe should not put an open or
+    /// default-credentialed network on the air just by being powered on.
+    fn access_point_configuration() -> Result<Option<AccessPointConfiguration>> {
+        let Some((ssid, password)) = CONTROL_AP_SSID.zip(CONTROL_AP_PASSWORD) else {
+            return Ok(None);
+        };
+        Ok(Some(AccessPointConfiguration {
+            ssid: ssid.try_into().map_err(|_| anyhow!("AP SSID too long"))?,
+            password: password
                 .try_into()
-                .map_err(|_| anyhow!("control AP SSID too long"))?,
-            password: CONTROL_AP_PASSWORD
-                .try_into()
-                .map_err(|_| anyhow!("control AP password too long"))?,
+                .map_err(|_| anyhow!("AP password too long"))?,
             auth_method: AuthMethod::WPA2Personal,
             max_connections: 4,
             ..Default::default()
-        })
+        }))
     }
 
     fn register_handlers(

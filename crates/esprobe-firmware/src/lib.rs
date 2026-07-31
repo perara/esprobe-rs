@@ -1,6 +1,9 @@
 //! Hardware-neutral contracts for the ESP32-C3 carrier board.
 
 pub mod safety;
+
+/// The credential codec, shared with the host tool.
+pub use esprobe_protocol::wifi as wifi_credentials;
 pub mod stm32g0;
 pub mod swd;
 
