@@ -1,0 +1,9 @@
+[package]
+name = "esprobe-protocol"
+description = "Wire protocol shared by the ESP32-C3 SWD bridge firmware and the esprobe host tool"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

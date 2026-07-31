@@ -1,0 +1,17 @@
+[package]
+name = "esprobe"
+description = "Use an ESP32-C3 as an SWD debug probe, over USB or Wi-Fi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+ctrlc = "3.4"
+esprobe-protocol = { path = "../esprobe-protocol" }
+probe-rs = "0.31"
+serialport = { version = "4.8", default-features = false }
+sha2 = "0.10"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
