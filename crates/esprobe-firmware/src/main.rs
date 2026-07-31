@@ -1507,7 +1507,7 @@ mod app {
         ip: std::net::Ipv4Addr,
     ) -> Result<()> {
         server.fn_handler("/health", Method::Get, move |req| {
-            let body = format!("{{\"ok\":true,\"service\":\"ir-control-hub\",\"ip\":\"{ip}\"}}\n");
+            let body = format!("{{\"ok\":true,\"service\":\"esprobe\",\"ip\":\"{ip}\"}}\n");
             req.into_ok_response()?.write_all(body.as_bytes())?;
             Ok::<(), anyhow::Error>(())
         })?;
