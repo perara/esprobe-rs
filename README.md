@@ -34,10 +34,18 @@ the end-to-end path as unproven until it has.
 ## Layout
 
 - `crates/esprobe` — the CLI and the probe-rs probe backend
-- `crates/esprobe-protocol` — the wire contract, shared with the firmware
+- `crates/esprobe-protocol` — the wire contract, shared by both halves
+- `crates/esprobe-firmware` — what runs on the ESP32-C3
 
-The firmware that runs on the ESP32-C3 lives separately; this repository is the
-host half.
+Both ends depend on the same protocol crate, so they cannot drift. The firmware
+is excluded from the workspace because it cross-compiles for
+`riscv32imc-esp-espidf` with its own toolchain; build it from its own directory.
+
+## Hardware
+
+An ESP32-C3 devkit and three wires — SWDIO, SWCLK and ground — with reset
+optional but worth having. The pin map is a build-time constant; see the
+firmware README, including which pins to avoid and why.
 
 ## Using it
 

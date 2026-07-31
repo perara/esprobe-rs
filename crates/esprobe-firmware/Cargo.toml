@@ -1,0 +1,42 @@
+[package]
+name = "esprobe-firmware"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+[lib]
+test = true
+bench = false
+
+[[bin]]
+name = "esprobe-firmware"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+esprobe-protocol = { path = "../esprobe-protocol" }
+
+[target.'cfg(target_os = "espidf")'.dependencies]
+anyhow = "1.0"
+critical-section = "1.2"
+embedded-svc = "0.29"
+esp-idf-svc = { version = "0.52.1", features = ["critical-section"] }
+log = "0.4"
+
+[build-dependencies]
+embuild = { version = "0.33", features = ["espidf"] }
+
+[profile.dev]
+debug = true
+opt-level = "z"
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+# The SWD transfer loop runs once per word of every read; sizing it down costs
+# real throughput and the image uses a quarter of the available flash.
+opt-level = 3
+panic = "abort"
+strip = true
