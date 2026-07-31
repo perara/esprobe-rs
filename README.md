@@ -25,8 +25,11 @@ Verified against an STM32G071 and an STM32F407 over USB:
 | Program, with backup and read-back verification | works |
 | Bulk read | 453 KiB/s |
 
-The Wi-Fi transport is implemented and unit-tested but **has not yet been
-exercised against hardware**. Treat it as unproven until it has.
+The Wi-Fi transport is implemented, and its host half is tested against a
+loopback stub bridge — framing over a socket, endpoint parsing, the handshake
+and factory selection. It has **not yet run against a bridge on a real
+network**, because the Wi-Fi it was to be tested on would not associate. Treat
+the end-to-end path as unproven until it has.
 
 ## Layout
 
