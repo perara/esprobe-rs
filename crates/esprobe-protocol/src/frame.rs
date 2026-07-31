@@ -1,6 +1,6 @@
 //! Framing contract for the USB-serial ARM DAP bridge.
 
-pub const VERSION: u8 = 2;
+pub const VERSION: u8 = 3;
 /// Large enough for a 256-word block read plus the envelope and worst-case
 /// COBS overhead. One USB round trip per kibibyte, rather than per word, is
 /// what keeps the wire — not the transport — the limiting factor.
@@ -8,8 +8,8 @@ pub const MAX_FRAME: usize = 4136;
 /// Words a single `ReadRegisterBlock` may carry. Matches the ADIv5 auto-
 /// increment window, so probe-rs's own 1 KiB chunking maps to one frame.
 pub const MAX_BLOCK_WORDS: usize = 1024;
-const REQUEST_MAGIC: &[u8; 4] = b"IRDB";
-const RESPONSE_MAGIC: &[u8; 4] = b"IRDR";
+const REQUEST_MAGIC: &[u8; 4] = b"ESPB";
+const RESPONSE_MAGIC: &[u8; 4] = b"ESPR";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FrameError;
@@ -304,6 +304,44 @@ fn crc16(bytes: &[u8]) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Byte-exact encodings the firmware and the host must both produce.
+    ///
+    /// This is the whole reason two copies of this file can coexist: the ends
+    /// are built by different toolchains for different architectures, and a
+    /// silent divergence here would show up as a bridge that connects and then
+    /// misbehaves. A changed command number, a changed magic, a changed CRC or
+    /// a changed COBS boundary all fail this instead.
+    #[test]
+    fn wire_format_fixtures() {
+        let mut frame = [0u8; MAX_FRAME + 2];
+
+        let length = encode_request(0x1234, Command::Hello, &[], &mut frame).unwrap();
+        assert_eq!(
+            &frame[..length],
+            &[11, b'E', b'S', b'P', b'B', 3, 0x34, 0x12, 1, 0xb3, 0x6f, 0],
+            "the Hello request encoding moved"
+        );
+
+        // The status byte is zero for Ok, so COBS relocates it: this fixture
+        // pins the framing as much as the fields.
+        let length = encode_response(0x1234, Status::Ok, &[0xde, 0xad], &mut frame).unwrap();
+        assert_eq!(
+            &frame[..length],
+            &[
+                8, b'E', b'S', b'P', b'R', 3, 0x34, 0x12, 5, 0xde, 0xad, 0x88, 0xde, 0
+            ],
+            "the response encoding moved"
+        );
+
+        // Command numbers are part of the contract; renumbering one silently
+        // repoints every host that has not been rebuilt.
+        assert_eq!(Command::Hello as u8, 0x01);
+        assert_eq!(Command::ReadRegister as u8, 0x10);
+        assert_eq!(Command::MemoryRead as u8, 0x29);
+        assert_eq!(Status::TargetInReset as u8, 8);
+        assert_eq!(VERSION, 3);
+    }
 
     #[test]
     fn request_round_trip_preserves_zero_bytes() {

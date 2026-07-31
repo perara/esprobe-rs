@@ -214,3 +214,85 @@ mod tests {
         assert_eq!(network_endpoint(r"COM3\"), None);
     }
 }
+
+#[cfg(test)]
+mod network_transport_tests {
+    use crate::{BRIDGE_TCP_PORT, SerialDapProbe};
+    use esprobe_protocol::frame::{Command, MAX_FRAME, Status, decode_request, encode_response};
+    use probe_rs::probe::ProbeFactory as _;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    /// Answers the handshake the way the firmware does, and nothing else.
+    ///
+    /// The network path cannot be proven without a bridge on a network, but the
+    /// half that lives here — framing over a socket, the endpoint parsing, the
+    /// transport abstraction — can be, and this is the part that would
+    /// otherwise only ever be exercised by hand.
+    fn spawn_stub_bridge() -> u16 {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind a loopback port");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut frame = [0u8; MAX_FRAME + 2];
+            let mut reply = [0u8; MAX_FRAME + 2];
+            let mut len = 0usize;
+            let mut byte = [0u8; 1];
+            while stream.read(&mut byte).unwrap_or(0) == 1 {
+                if byte[0] != 0 {
+                    if len < frame.len() {
+                        frame[len] = byte[0];
+                        len += 1;
+                    }
+                    continue;
+                }
+                if len == 0 {
+                    continue;
+                }
+                if let Ok(request) = decode_request(&mut frame[..len]) {
+                    let payload: &[u8] = match request.command {
+                        Command::Hello => b"DAP1",
+                        // Block words then clock, as the firmware reports.
+                        Command::Capabilities => &[0, 4, 0, 0, 0x00, 0x12, 0x7a, 0x00],
+                        _ => &[],
+                    };
+                    if let Ok(n) =
+                        encode_response(request.sequence, Status::Ok, payload, &mut reply)
+                    {
+                        let _ = stream.write_all(&[0]);
+                        let _ = stream.write_all(&reply[..n]);
+                    }
+                }
+                len = 0;
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn the_network_transport_completes_a_handshake() {
+        let port = spawn_stub_bridge();
+        let probe = SerialDapProbe::connect(&format!("127.0.0.1:{port}"))
+            .expect("the bridge handshake should complete over TCP");
+        // Capabilities is what tells the host how much it may ask for at once.
+        assert_eq!(probe.block_words, 1024);
+    }
+
+    #[test]
+    fn the_factory_opens_a_network_bridge_from_a_selector() {
+        let port = spawn_stub_bridge();
+        let selector = probe_rs::probe::DebugProbeSelector {
+            vendor_id: super::ESPRESSIF_VID,
+            product_id: super::USB_SERIAL_JTAG_PID,
+            interface: None,
+            serial_number: Some(format!("127.0.0.1:{port}")),
+        };
+        assert!(
+            super::EspBridgeFactory.open(&selector).is_ok(),
+            "probe-rs should reach a network bridge through the factory"
+        );
+        let _ = BRIDGE_TCP_PORT;
+    }
+}
