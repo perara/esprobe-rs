@@ -5,7 +5,7 @@ firmware_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 secrets_file="${firmware_dir}/.env.local"
 
 if [[ ! -f "${secrets_file}" ]]; then
-    echo "missing ${secrets_file}; copy wifi.env.example and set WIFI_PASSWORD" >&2
+    echo "missing ${secrets_file}; copy wifi.env.example and set CONTROL_AP_PASSWORD" >&2
     exit 2
 fi
 
@@ -14,8 +14,6 @@ set -a
 source "${secrets_file}"
 set +a
 
-: "${WIFI_SSID:?WIFI_SSID is required}"
-: "${WIFI_PASSWORD:?WIFI_PASSWORD is required}"
 : "${CONTROL_AP_SSID:?CONTROL_AP_SSID is required}"
 : "${CONTROL_AP_PASSWORD:?CONTROL_AP_PASSWORD is required}"
 

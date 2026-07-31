@@ -58,10 +58,6 @@ mod app {
     // Build-time credentials are a convenience for a bench that always joins
     // the same network, not a requirement: an image with none still builds,
     // still bridges over USB, and can be given a network at runtime.
-    const WIFI_SSID: Option<&str> = option_env!("WIFI_SSID");
-    const WIFI_PASSWORD: Option<&str> = option_env!("WIFI_PASSWORD");
-    const WIFI_SSID_FALLBACK: Option<&str> = option_env!("WIFI_SSID_FALLBACK");
-    const WIFI_PASSWORD_FALLBACK: Option<&str> = option_env!("WIFI_PASSWORD_FALLBACK");
     const CONTROL_AP_SSID: Option<&str> = option_env!("CONTROL_AP_SSID");
     const CONTROL_AP_PASSWORD: Option<&str> = option_env!("CONTROL_AP_PASSWORD");
     /// Where runtime credentials live, so a network change costs a command
@@ -1152,14 +1148,14 @@ mod app {
     }
 
     fn store_wifi_credentials(ssid: &str, password: &str) -> Result<()> {
-        let mut store = credential_store()?;
+        let store = credential_store()?;
         store.set_str(NVS_SSID, ssid)?;
         store.set_str(NVS_PASSWORD, password)?;
         Ok(())
     }
 
     fn forget_wifi_credentials() -> Result<()> {
-        let mut store = credential_store()?;
+        let store = credential_store()?;
         // Stored empty rather than removed. An absent key means "never
         // provisioned", which falls back to whatever the image was built with;
         // an empty one means the host said forget, and has to outrank that.
@@ -1169,35 +1165,31 @@ mod app {
         Ok(())
     }
 
-    /// Credentials from storage, falling back to any compiled into the image.
+    /// The network this probe has been told to join, if any.
     ///
-    /// Storage always wins, including when it holds an empty SSID: that is the
-    /// host having said forget, and a build-time credential must not undo it.
-    /// Only a device that has never been provisioned uses the image's own.
+    /// Storage is the only source. Credentials used to be compiled in as well,
+    /// which put the real passphrase into every image built and meant `forget`
+    /// could not actually forget — it cleared storage and the build-time value
+    /// took over again. Provisioning over the bridge replaces all of that.
     fn load_wifi_credentials() -> Option<(String, String)> {
-        let mut store = credential_store().ok()?;
+        let store = credential_store().ok()?;
         let mut ssid = [0u8; wifi_credentials::MAX_SSID + 1];
         let mut password = [0u8; wifi_credentials::MAX_PASSWORD + 1];
-        let stored = store
+        // An empty stored SSID is the host having said forget, which is not
+        // the same as never provisioned; both end up here as `None`.
+        let ssid = store
             .get_str(NVS_SSID, &mut ssid)
             .ok()
             .flatten()
-            .map(|value| value.to_string());
-        if let Some(ssid) = stored {
-            if ssid.is_empty() {
-                return None;
-            }
-            let password = store
-                .get_str(NVS_PASSWORD, &mut password)
-                .ok()
-                .flatten()
-                .unwrap_or("")
-                .to_string();
-            return Some((ssid, password));
-        }
-        WIFI_SSID
-            .zip(WIFI_PASSWORD)
-            .map(|(ssid, password)| (ssid.to_string(), password.to_string()))
+            .filter(|ssid| !ssid.is_empty())?
+            .to_string();
+        let password = store
+            .get_str(NVS_PASSWORD, &mut password)
+            .ok()
+            .flatten()
+            .unwrap_or("")
+            .to_string();
+        Some((ssid, password))
     }
 
     /// Every GPIO the chip has, indexed by its number.
@@ -1332,6 +1324,11 @@ mod app {
         let mut server = EspHttpServer::new(&Default::default())?;
         register_handlers(&mut server, hub, Ipv4Addr::UNSPECIFIED)?;
 
+        // What the radio should be on, read from storage once. Re-reading it
+        // every pass reopened the NVS handle twice a second, which is both
+        // pointless work and two lines of log noise per second.
+        let mut credentials = load_wifi_credentials();
+
         loop {
             thread::sleep(Duration::from_secs(2));
 
@@ -1341,6 +1338,7 @@ mod app {
                 Err(_) => (None, false),
             };
             if forget {
+                credentials = None;
                 info!("Wi-Fi credentials cleared; disconnecting");
                 let _ = wifi.disconnect();
                 // Back to whatever an unprovisioned probe does, which is to
@@ -1358,10 +1356,11 @@ mod app {
                     Ok(false) => warn!("Could not join {ssid}"),
                     Err(error) => warn!("Joining {ssid} failed: {error}"),
                 }
+                credentials = Some((ssid, password));
             } else if !wifi.is_connected().unwrap_or(false)
-                && let Some((ssid, password)) = load_wifi_credentials()
+                && let Some((ssid, password)) = credentials.as_ref()
             {
-                let _ = join_wifi(&mut wifi, &ssid, &password);
+                let _ = join_wifi(&mut wifi, ssid, password);
             }
 
             // Publish what the host will see through `wifi status`.
@@ -1382,8 +1381,9 @@ mod app {
                     .get_ip_info()
                     .map(|info| info.ip.octets())
                     .unwrap_or([0; 4]);
-                control.ssid = load_wifi_credentials()
-                    .map(|(ssid, _)| ssid)
+                control.ssid = credentials
+                    .as_ref()
+                    .map(|(ssid, _)| ssid.clone())
                     .unwrap_or_default();
             }
         }

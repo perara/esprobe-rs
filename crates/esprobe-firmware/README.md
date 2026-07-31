@@ -85,13 +85,34 @@ espflash flash --monitor \
   target/riscv32imc-esp-espidf/release/esprobe-firmware
 ```
 
-`.env.local` is ignored by Git and is the only place credentials belong.
-`WIFI_SSID_FALLBACK` and `WIFI_PASSWORD_FALLBACK` are optional; a second
-network is useful when the bridge moves between benches.
+`.env.local` is ignored by Git and holds only the fallback access point's name
+and password. The network the probe joins is not built in — provision it at
+runtime with `esprobe wifi set`, which stores it in NVS. That way no image
+carries a real passphrase, and repointing a probe does not mean rebuilding it.
 
-The SoftAP uses the ESP-IDF default address `192.168.71.1` and stays available
-while infrastructure association is retried. Configure its SSID and WPA2
-password through `CONTROL_AP_SSID` and `CONTROL_AP_PASSWORD`.
+The access point comes up only when there is no network to join, and uses the
+ESP-IDF default address `192.168.71.1`. Station and access point share one
+radio, so running both leaves the station being dragged onto the access point's
+channel mid-authentication.
+
+## Telling a radio fault from a firmware fault
+
+`src/bin/radio-check.rs` is a control image: an open access point and a scan
+loop, and nothing else — no GPIO claims, no GPSPI2, no USB driver, no servers.
+Flash it, then look for `esprobe-radio-check` from another machine.
+
+```bash
+cargo build --release --bin radio-check
+espflash flash --monitor target/riscv32imc-esp-espidf/release/radio-check
+```
+
+It logs the negotiated transmit power and what the scan hears every ten
+seconds. If the scan reports access points while `esprobe-radio-check` is
+invisible from a machine in the same room, the radio receives but does not
+transmit, and that is not something firmware can fix. Erasing the flash
+entirely (`espflash erase-flash`) first is worth doing once: it forces a full
+RF calibration instead of reusing stored calibration data, which is the one
+storage-side cause of exactly that symptom.
 
 ## esprobe: a probe-rs probe
 
