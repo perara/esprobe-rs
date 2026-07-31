@@ -870,6 +870,11 @@ mod app {
                     let mut wifi = self.wifi.lock().map_err(|_| SwdError::Protocol(3))?;
                     wifi.pending = Some((ssid.to_string(), password.to_string()));
                     wifi.forget = false;
+                    // Published here, not from the loop: a join blocks that
+                    // loop for the better part of half a minute, and for all
+                    // of it `wifi status` was still answering "no network
+                    // configured" about the network just handed to it.
+                    wifi.ssid = ssid.to_string();
                     Ok(0)
                 }
                 BridgeCommand::WifiForget => {
@@ -877,6 +882,9 @@ mod app {
                     let mut wifi = self.wifi.lock().map_err(|_| SwdError::Protocol(0))?;
                     wifi.pending = None;
                     wifi.forget = true;
+                    wifi.ssid = String::new();
+                    wifi.connected = false;
+                    wifi.ip = [0; 4];
                     Ok(0)
                 }
                 BridgeCommand::PinMap => {
@@ -1152,16 +1160,20 @@ mod app {
 
     fn forget_wifi_credentials() -> Result<()> {
         let mut store = credential_store()?;
-        // Absent keys are not an error: forgetting twice should succeed.
-        let _ = store.remove(NVS_SSID);
+        // Stored empty rather than removed. An absent key means "never
+        // provisioned", which falls back to whatever the image was built with;
+        // an empty one means the host said forget, and has to outrank that.
+        // Removing the key made `forget` report success and change nothing.
+        store.set_str(NVS_SSID, "")?;
         let _ = store.remove(NVS_PASSWORD);
         Ok(())
     }
 
     /// Credentials from storage, falling back to any compiled into the image.
     ///
-    /// Storage wins, so a provisioned network is not silently overridden by
-    /// whatever the image happened to be built with.
+    /// Storage always wins, including when it holds an empty SSID: that is the
+    /// host having said forget, and a build-time credential must not undo it.
+    /// Only a device that has never been provisioned uses the image's own.
     fn load_wifi_credentials() -> Option<(String, String)> {
         let mut store = credential_store().ok()?;
         let mut ssid = [0u8; wifi_credentials::MAX_SSID + 1];
@@ -1170,9 +1182,11 @@ mod app {
             .get_str(NVS_SSID, &mut ssid)
             .ok()
             .flatten()
-            .filter(|value| !value.is_empty())
             .map(|value| value.to_string());
         if let Some(ssid) = stored {
+            if ssid.is_empty() {
+                return None;
+            }
             let password = store
                 .get_str(NVS_PASSWORD, &mut password)
                 .ok()
@@ -1329,6 +1343,13 @@ mod app {
             if forget {
                 info!("Wi-Fi credentials cleared; disconnecting");
                 let _ = wifi.disconnect();
+                // Back to whatever an unprovisioned probe does, which is to
+                // publish its own access point. Disconnecting alone left the
+                // radio configured for a network it had just been told to
+                // forget, and with no way back in over the air.
+                if let Err(error) = apply_configuration(&mut wifi, None) {
+                    warn!("Could not fall back to the access point: {error}");
+                }
             }
             if let Some((ssid, password)) = pending {
                 info!("Joining Wi-Fi {ssid} on request");
@@ -1345,7 +1366,16 @@ mod app {
 
             // Publish what the host will see through `wifi status`.
             if let Ok(mut control) = wifi_control.lock() {
-                control.connected = wifi.is_connected().unwrap_or(false);
+                // `is_connected` is also true for a running access point,
+                // which reported a connection with no network and no address.
+                // An address on the station interface is the thing the host
+                // actually cares about.
+                control.connected = wifi.is_connected().unwrap_or(false)
+                    && wifi
+                        .wifi()
+                        .sta_netif()
+                        .get_ip_info()
+                        .is_ok_and(|info| !info.ip.is_unspecified());
                 control.ip = wifi
                     .wifi()
                     .sta_netif()
