@@ -50,6 +50,9 @@ pub enum Command {
     Profile = 0x2b,
     Echo = 0x2c,
     PinMap = 0x2d,
+    WifiStatus = 0x2e,
+    WifiSet = 0x2f,
+    WifiForget = 0x30,
 }
 
 impl TryFrom<u8> for Command {
@@ -90,6 +93,9 @@ impl TryFrom<u8> for Command {
             0x2b => Ok(Self::Profile),
             0x2c => Ok(Self::Echo),
             0x2d => Ok(Self::PinMap),
+            0x2e => Ok(Self::WifiStatus),
+            0x2f => Ok(Self::WifiSet),
+            0x30 => Ok(Self::WifiForget),
             _ => Err(FrameError),
         }
     }
@@ -387,6 +393,9 @@ mod tests {
         assert_eq!(Command::try_from(0x2b), Ok(Command::Profile));
         assert_eq!(Command::try_from(0x2c), Ok(Command::Echo));
         assert_eq!(Command::try_from(0x2d), Ok(Command::PinMap));
+        assert_eq!(Command::try_from(0x2e), Ok(Command::WifiStatus));
+        assert_eq!(Command::try_from(0x2f), Ok(Command::WifiSet));
+        assert_eq!(Command::try_from(0x30), Ok(Command::WifiForget));
     }
 
     #[test]

@@ -73,6 +73,25 @@ enum Engine {
     BitBang,
 }
 
+/// Network provisioning, done over whichever link is already connected.
+#[derive(Subcommand)]
+enum WifiAction {
+    /// Report whether the bridge is on a network, and which.
+    Status,
+    /// Give the bridge a network. Stored on the device, so it survives a power
+    /// cycle and does not need to be built into the image.
+    Set {
+        #[arg(long)]
+        ssid: String,
+        /// Omit for an open network; you will be prompted rather than passing
+        /// it on a command line that the shell will remember.
+        #[arg(long)]
+        password: Option<String>,
+    },
+    /// Forget the stored network.
+    Forget,
+}
+
 #[derive(Subcommand)]
 enum Action {
     /// Read SWDIO, SWCLK, and RESET_ALL after ESP drive is released.
@@ -166,6 +185,9 @@ enum Action {
     },
     /// List every probe probe-rs can see, this bridge included.
     ListProbes,
+    /// Read or change the network the bridge joins.
+    #[command(subcommand)]
+    Wifi(WifiAction),
     /// Read the target's identity registers and say what it actually is.
     Identify,
     /// Report the GPIO map the running firmware was built for.
@@ -453,6 +475,42 @@ fn main() -> Result<()> {
                 None => println!("probe_rs_target=unknown; pass --target explicitly"),
             }
             serial.detach()?;
+            return Ok(());
+        }
+        Action::Wifi(action) => {
+            match action {
+                WifiAction::Status => {
+                    let reply = serial.command(Command::WifiStatus, &[])?;
+                    let [connected, a, b, c, d, ssid_len, ssid @ ..] = reply.as_slice() else {
+                        bail!("invalid wifi-status response");
+                    };
+                    let ssid = std::str::from_utf8(&ssid[..usize::from(*ssid_len).min(ssid.len())])
+                        .unwrap_or("<invalid utf-8>");
+                    if *connected != 0 {
+                        println!("connected ssid={ssid} ip={a}.{b}.{c}.{d}");
+                    } else if ssid.is_empty() {
+                        println!("no network configured");
+                    } else {
+                        println!("configured ssid={ssid} but not connected");
+                    }
+                }
+                WifiAction::Set { ssid, password } => {
+                    let password = match password {
+                        Some(password) => password.clone(),
+                        None => rpassword::prompt_password("Wi-Fi password (empty for open): ")
+                            .context("failed to read the password")?,
+                    };
+                    let mut payload = vec![0u8; 2 + ssid.len() + password.len()];
+                    let length = esprobe_protocol::wifi::encode(ssid, &password, &mut payload)
+                        .context("SSID or password is too long")?;
+                    serial.command(Command::WifiSet, &payload[..length])?;
+                    println!("stored ssid={ssid}; the bridge will join within a few seconds");
+                }
+                WifiAction::Forget => {
+                    serial.command(Command::WifiForget, &[])?;
+                    println!("forgotten");
+                }
+            }
             return Ok(());
         }
         Action::PinMap => {
@@ -902,6 +960,7 @@ fn main() -> Result<()> {
         Action::PinMap => unreachable!("pin map returned before probe attachment"),
         Action::Identify => unreachable!("identify returned before probe attachment"),
         Action::ListProbes => unreachable!("probe listing returned before a link was opened"),
+        Action::Wifi(_) => unreachable!("wifi provisioning returned before probe attachment"),
         Action::Profile { .. } => unreachable!("profile returned before probe attachment"),
         Action::FastDump { .. } => unreachable!("fast dump returned before probe attachment"),
         Action::ResetLines => {
