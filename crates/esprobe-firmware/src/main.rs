@@ -68,6 +68,8 @@ mod app {
     const DEFAULT_WIFI_COUNTRY: &str = "NO";
 
     const NVS_NAMESPACE: &str = "esprobe";
+    /// The transmit power that last associated successfully.
+    const NVS_TX_POWER: &str = "txpower";
     const NVS_SSID: &str = "sta_ssid";
     const NVS_PASSWORD: &str = "sta_pass";
     const MAX_DISPLAY_FRAME: usize = 1024;
@@ -1333,6 +1335,7 @@ mod app {
         // every pass reopened the NVS handle twice a second, which is both
         // pointless work and two lines of log noise per second.
         let mut credentials = load_wifi_credentials();
+        let mut attempt = 0usize;
 
         loop {
             thread::sleep(Duration::from_secs(2));
@@ -1356,16 +1359,23 @@ mod app {
             }
             if let Some((ssid, password)) = pending {
                 info!("Joining Wi-Fi {ssid} on request");
-                match join_wifi(&mut wifi, &ssid, &password) {
+                attempt = 0;
+                match join_wifi(&mut wifi, &ssid, &password, attempt) {
                     Ok(true) => info!("Joined {ssid}"),
                     Ok(false) => warn!("Could not join {ssid}"),
                     Err(error) => warn!("Joining {ssid} failed: {error}"),
                 }
+                attempt += 1;
                 credentials = Some((ssid, password));
             } else if !wifi.is_connected().unwrap_or(false)
                 && let Some((ssid, password)) = credentials.as_ref()
             {
-                let _ = join_wifi(&mut wifi, ssid, password);
+                // Each retry moves down the ladder; a success stops it moving.
+                if join_wifi(&mut wifi, ssid, password, attempt).unwrap_or(false) {
+                    info!("Joined {ssid}");
+                } else {
+                    attempt += 1;
+                }
             }
 
             // Publish what the host will see through `wifi status`.
@@ -1580,7 +1590,23 @@ mod app {
         let credentials = load_wifi_credentials();
         apply_configuration(wifi, credentials.as_ref())?;
         wifi.start()?;
+        disable_power_save();
         Ok(())
+    }
+
+    /// A debug probe wants latency, not battery life.
+    ///
+    /// Modem sleep parks the radio between beacons, which put 130 ms on a round
+    /// trip to a bridge whose gateway answers in 0.3 ms, and every SWD command
+    /// pays it.
+    fn disable_power_save() {
+        // SAFETY: the driver is started; this only sets a power-save mode.
+        let result = unsafe {
+            esp_idf_svc::sys::esp_wifi_set_ps(esp_idf_svc::sys::wifi_ps_type_t_WIFI_PS_NONE)
+        };
+        if result != esp_idf_svc::sys::ESP_OK {
+            warn!("Could not disable Wi-Fi power save: {result}");
+        }
     }
 
     /// Leaves ESP-IDF's world-safe regulatory mode for a named country.
@@ -1634,11 +1660,52 @@ mod app {
         Ok(())
     }
 
+    /// Transmit powers to try, in quarter-dBm, strongest first.
+    ///
+    /// Full power is not always the best power. The ESP32-C3 SuperMini's
+    /// antenna is badly matched, and a mismatched antenna reflects the power
+    /// amplifier's output back into it; backing the drive off can put a
+    /// cleaner signal on the air than driving it flat out. Since which level
+    /// wins depends on the board, the join tries them in turn rather than
+    /// assuming.
+    const TX_POWER_LADDER: [i8; 5] = [80, 60, 52, 40, 32];
+
+    /// The transmit power that last worked, so a probe does not re-derive it.
+    fn load_tx_power() -> Option<i8> {
+        credential_store()
+            .ok()?
+            .get_u8(NVS_TX_POWER)
+            .ok()
+            .flatten()
+            .map(|stored| stored as i8)
+    }
+
+    fn store_tx_power(power: i8) {
+        if let Ok(store) = credential_store()
+            && store.set_u8(NVS_TX_POWER, power as u8).is_err()
+        {
+            warn!("Could not remember the working transmit power");
+        }
+    }
+
+    /// Which power to try on this attempt.
+    ///
+    /// The level that worked last time goes first, so a probe that has already
+    /// found its board's sweet spot joins immediately instead of spending a
+    /// minute walking back down the ladder on every boot.
+    fn tx_power_for(attempt: usize, remembered: Option<i8>) -> i8 {
+        match remembered {
+            Some(power) if attempt == 0 => power,
+            _ => TX_POWER_LADDER[attempt % TX_POWER_LADDER.len()],
+        }
+    }
+
     /// Associates with one network, leaving the access point as it was.
     fn join_wifi(
         wifi: &mut BlockingWifi<EspWifi<'static>>,
         ssid: &str,
         password: &str,
+        attempt: usize,
     ) -> Result<bool> {
         let _ = wifi.disconnect();
         if !wifi.is_started().unwrap_or(false) {
@@ -1676,8 +1743,24 @@ mod app {
             strongest.as_ref().map(|point| point.channel),
         )?;
         wifi.set_configuration(&Configuration::Client(station))?;
+
+        let tx_power = tx_power_for(attempt, load_tx_power());
+        // SAFETY: the radio is started and this only sets a driver limit.
+        unsafe { esp_idf_svc::sys::esp_wifi_set_max_tx_power(tx_power) };
+        info!(
+            "Attempt {attempt} at {}.{} dBm",
+            tx_power / 4,
+            (tx_power % 4) * 25
+        );
         match wifi.connect().and_then(|()| wifi.wait_netif_up()) {
-            Ok(()) => Ok(true),
+            Ok(()) => {
+                // Re-applied after association: setting it once at start-up
+                // did not survive `connect`, and the round trip stayed at
+                // 130 ms against a gateway 0.3 ms away.
+                disable_power_save();
+                store_tx_power(tx_power);
+                Ok(true)
+            }
             Err(error) => {
                 warn!("Association with {ssid} failed: {error}");
                 // Which access points actually answered, so a failure to join

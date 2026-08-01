@@ -1371,7 +1371,9 @@ impl Transport {
         // A request/response protocol gains nothing from Nagle and loses a
         // round trip to it.
         stream.set_nodelay(true)?;
-        stream.set_read_timeout(Some(Duration::from_millis(50)))?;
+        // Wi-Fi round trips are two orders of magnitude longer than USB's, and
+        // this only bounds how long a quiet read blocks before looping.
+        stream.set_read_timeout(Some(Duration::from_millis(250)))?;
         Ok(Self {
             port: Box::new(stream),
             sequence: 0,
@@ -1421,7 +1423,21 @@ impl Transport {
         while Instant::now() < deadline {
             let read = match self.port.read(&mut chunk) {
                 Ok(read) => read,
-                Err(error) if error.kind() == std::io::ErrorKind::TimedOut => continue,
+                // A serial port reports a lapsed read timeout as `TimedOut`; a
+                // socket reports it as `WouldBlock`. Only the first was
+                // handled, so the network transport failed on its first quiet
+                // moment with "Resource temporarily unavailable" — which never
+                // showed up until a bridge was actually reachable over Wi-Fi.
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    continue;
+                }
                 Err(error) => return Err(error.into()),
             };
             for &byte in &chunk[..read] {

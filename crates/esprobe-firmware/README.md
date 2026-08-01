@@ -117,13 +117,18 @@ Two things this found, in the order they had to be found:
    looked exactly like a dead transmitter. `WIFI_COUNTRY` at build time (see
    `set_regulatory_domain`) is what fixes it, and nothing else can be measured
    until it is set.
-2. **Radiated power is far below what the chip reports.** With transmission
-   working, the access point arrives at roughly -78 dBm from twenty
-   centimetres away, while access points several metres off arrive at -51 to
-   -61. Free-space loss over twenty centimetres is about 26 dB, so 20 dBm at
-   the pin should arrive near -6. Something in the antenna path is losing
-   around seventy decibels, which is why an access point five metres away
-   never answers an authentication request. If the scan reports access points while `esprobe-radio-check` is
+2. **Full transmit power does not associate on an ESP32-C3 SuperMini.** That
+   board's antenna is poorly matched, and a mismatched antenna reflects the
+   power amplifier's output back into it. At 20 dBm and 15 dBm the access
+   point never answers; at 13 dBm it associates immediately, reproducibly,
+   from the same position. `TX_POWER_LADDER` walks 20, 15, 13, 10 and 8 dBm on
+   successive attempts and stores whichever one worked in NVS, so the next
+   boot joins in eight seconds rather than sixty.
+
+   The link stays marginal — round trips of 60 to 160 ms to a gateway that
+   answers in 0.3 ms, which is 802.11 retrying. Soldering a 28-30 mm wire
+   antenna to that board is the physical fix; the ladder is what makes it work
+   without one. If the scan reports access points while `esprobe-radio-check` is
 invisible from a machine in the same room, the radio receives but does not
 transmit, and that is not something firmware can fix. Erasing the flash
 entirely (`espflash erase-flash`) first is worth doing once: it forces a full
