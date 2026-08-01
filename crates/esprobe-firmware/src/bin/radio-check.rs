@@ -53,10 +53,18 @@ fn main() -> anyhow::Result<()> {
     wifi.start()?;
     info!("Access point 'esprobe-radio-check' started on channel 1");
 
+    // Steps the transmit power down over time. If nothing is heard at 20 dBm
+    // but beacons appear at 5, the power amplifier is browning out its supply
+    // rather than radiating into a broken antenna — the two hardware faults
+    // that both look like "receive works, transmit does not", and they need
+    // completely different fixes. Quarter-dBm units, as the API takes them.
+    const TX_POWER_STEPS: [i8; 5] = [80, 52, 32, 20, 8];
+
     // What the radio can hear, next to what it claims to transmit. A scan that
     // works while the access point stays invisible is receive without
     // transmit, which is the whole question.
-    loop {
+    for step in TX_POWER_STEPS.into_iter().cycle() {
+        unsafe { esp_idf_svc::sys::esp_wifi_set_max_tx_power(step) };
         std::thread::sleep(std::time::Duration::from_secs(10));
         let max_tx_power = unsafe {
             let mut power = 0i8;
@@ -77,4 +85,5 @@ fn main() -> anyhow::Result<()> {
             Err(error) => info!("tx power {max_tx_power}, scan failed: {error}"),
         }
     }
+    unreachable!("the power sweep cycles forever")
 }
