@@ -49,7 +49,7 @@ mod tests {
 
     #[test]
     fn ordinary_text_is_unchanged() {
-        assert_eq!(escape("Spikkelia-28"), "Spikkelia-28");
+        assert_eq!(escape("bench-network-2"), "bench-network-2");
         // Non-ASCII is valid unescaped in JSON and should stay readable.
         assert_eq!(escape("kjøkkenet"), "kjøkkenet");
     }
