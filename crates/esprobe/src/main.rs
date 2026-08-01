@@ -1358,6 +1358,18 @@ impl<T: std::io::Read + std::io::Write + Send> Link for T {}
 struct Transport {
     port: Box<dyn Link>,
     sequence: u16,
+    /// Bytes read from the link but not yet consumed by a frame.
+    ///
+    /// This has to outlive a single `receive`. With a request in flight ahead
+    /// of the reply being read, one read can carry the end of one reply and
+    /// the beginning of the next; when that buffer was a local, the beginning
+    /// of the next reply went out of scope with it, and the following
+    /// `receive` waited three seconds for a frame whose first bytes had
+    /// already been thrown away. Sequential commands never saw it because they
+    /// never have a second reply in flight — which is why `ping` was reliable
+    /// over two hundred round trips while a bulk read of the same length was
+    /// not.
+    pending: Vec<u8>,
 }
 
 impl fmt::Debug for Transport {
@@ -1388,6 +1400,7 @@ impl Transport {
         Ok(Self {
             port: Box::new(stream),
             sequence: 0,
+            pending: Vec::new(),
         })
     }
 
@@ -1401,6 +1414,7 @@ impl Transport {
         Ok(Self {
             port: Box::new(port),
             sequence: 0,
+            pending: Vec::new(),
         })
     }
 
@@ -1425,13 +1439,32 @@ impl Transport {
 
     fn receive(&mut self, sequence: u16) -> Result<Vec<u8>> {
         let deadline = Instant::now() + Duration::from_secs(3);
-        let mut frame = [0u8; MAX_FRAME + 2];
-        let mut frame_len = 0usize;
         // One read syscall per frame rather than per packet. A 4 KiB reply took
         // nine calls at 512 bytes, and their latency lands squarely between the
         // reply arriving and the next request going out.
         let mut chunk = [0u8; MAX_FRAME + 2];
-        while Instant::now() < deadline {
+        loop {
+            // Whatever is already buffered, before asking the link for more.
+            while let Some(end) = self.pending.iter().position(|&byte| byte == 0) {
+                let mut frame: Vec<u8> = self.pending.drain(..=end).collect();
+                frame.pop();
+                if frame.is_empty() {
+                    continue;
+                }
+                if let Ok(response) = decode_response(&mut frame)
+                    && response.sequence == sequence
+                {
+                    return match response.status {
+                        Status::Ok => Ok(response.payload.to_vec()),
+                        status => {
+                            bail!("bridge status {status:?}, detail={:02x?}", response.payload)
+                        }
+                    };
+                }
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
             let read = match self.port.read(&mut chunk) {
                 // Zero bytes from a socket is the peer having closed it, which
                 // no amount of waiting undoes. Falling through to the loop
@@ -1456,33 +1489,14 @@ impl Transport {
                 }
                 Err(error) => return Err(error.into()),
             };
-            for &byte in &chunk[..read] {
-                if byte != 0 {
-                    if frame_len < frame.len() {
-                        frame[frame_len] = byte;
-                        frame_len += 1;
-                    } else {
-                        frame_len = 0;
-                    }
-                    continue;
-                }
-                if frame_len == 0 {
-                    continue;
-                }
-                if let Ok(response) = decode_response(&mut frame[..frame_len])
-                    && response.sequence == sequence
-                {
-                    return match response.status {
-                        Status::Ok => Ok(response.payload.to_vec()),
-                        status => {
-                            bail!("bridge status {status:?}, detail={:02x?}", response.payload)
-                        }
-                    };
-                }
-                frame_len = 0;
+            self.pending.extend_from_slice(&chunk[..read]);
+            // A link emitting bytes with no delimiter in them is not going to
+            // start; do not grow without bound waiting for one.
+            if self.pending.len() > 4 * (MAX_FRAME + 2) {
+                self.pending.clear();
             }
         }
-        bail!("USB bridge response timeout")
+        bail!("bridge response timeout")
     }
 }
 
