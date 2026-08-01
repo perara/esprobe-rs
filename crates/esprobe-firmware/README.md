@@ -21,8 +21,13 @@ will be used in — plus the fallback access point's name and password. The buil
 refuses to run without them. `WIFI_COUNTRY` is deliberately not defaulted: see
 the diagnostics section below for what world-safe mode does to this chip.
 
-Wi-Fi is optional. Without a station link the bridge still works over USB, and
-the SoftAP keeps it reachable when no infrastructure network is.
+Wi-Fi is optional. Without a station link the bridge still works over USB.
+
+The access point is published whenever the probe has no network to join, and
+again for about thirty seconds after a full ladder of join attempts has failed
+— station and access point share one radio, so joining necessarily takes it
+down, and a probe given a wrong passphrase would otherwise be reachable only
+over the cable the access point exists to replace.
 
 ## Wiring
 
