@@ -13,7 +13,6 @@ mod spi_wire;
 
 #[cfg(target_os = "espidf")]
 mod app {
-    use std::net::Ipv4Addr;
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::Duration;
@@ -1334,7 +1333,7 @@ mod app {
         spawn_network_bridge(hub.clone())?;
 
         let mut server = EspHttpServer::new(&Default::default())?;
-        register_handlers(&mut server, hub, Ipv4Addr::UNSPECIFIED)?;
+        register_handlers(&mut server, hub, wifi_control.clone())?;
 
         // What the radio should be on, read from storage once. Re-reading it
         // every pass reopened the NVS handle twice a second, which is both
@@ -1403,7 +1402,14 @@ mod app {
                     // probe given a wrong passphrase, or carried out of range,
                     // has no way in but the cable the access point exists to
                     // avoid needing. Give it back for a while, then try again.
-                    if attempt.is_multiple_of(TX_POWER_LADDER.len()) {
+                    // Only worth pausing for if there is an access point to
+                    // pause for. Built without one, `apply_configuration`
+                    // programs an empty station and still succeeds, so waiting
+                    // would spend a third of the retry budget on a fallback
+                    // that does not exist while the log claimed otherwise.
+                    if attempt.is_multiple_of(TX_POWER_LADDER.len())
+                        && access_point_configuration().is_ok_and(|ap| ap.is_some())
+                    {
                         warn!(
                             "{ssid} did not answer at any transmit power; \
                              publishing the access point for {AP_FALLBACK_PASSES} passes"
@@ -1906,10 +1912,24 @@ mod app {
     fn register_handlers(
         server: &mut EspHttpServer<'static>,
         hub: Arc<Mutex<Hub>>,
-        ip: std::net::Ipv4Addr,
+        wifi: Arc<Mutex<WifiControl>>,
     ) -> Result<()> {
         server.fn_handler("/health", Method::Get, move |req| {
-            let body = format!("{{\"ok\":true,\"service\":\"esprobe\",\"ip\":\"{ip}\"}}\n");
+            // Read per request, not captured at start-up. The address is not
+            // known when the server is built, and it changes when the probe
+            // moves between networks — a field baked in at boot answered
+            // 0.0.0.0 for the life of the process, which is worse than absent
+            // for anything discovering probes by polling this.
+            let (ssid, ip) = match wifi.lock() {
+                Ok(state) => (
+                    state.ssid.clone(),
+                    std::net::Ipv4Addr::from(state.ip).to_string(),
+                ),
+                Err(_) => (String::new(), String::from("0.0.0.0")),
+            };
+            let body = format!(
+                "{{\"ok\":true,\"service\":\"esprobe\",\"ip\":\"{ip}\",\"ssid\":\"{ssid}\"}}\n"
+            );
             req.into_ok_response()?.write_all(body.as_bytes())?;
             Ok::<(), anyhow::Error>(())
         })?;

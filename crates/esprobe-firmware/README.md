@@ -61,9 +61,10 @@ can be checked rather than assumed.
 
 This firmware began as the control hub for one particular board, and still
 carries parts that only make sense there: a analog switch mux for selecting between
-four SWD targets, a display UART bridge, an on-device STM32G030 flashing path,
-and an HTTP control API. They are harmless if the pins are unused, and will be
-feature-gated rather than left as permanent furniture.
+four SWD targets, a display UART bridge, and the HTTP endpoints that drive
+them. They are harmless if the pins are unused, and will be feature-gated
+rather than left as permanent furniture. The rest of the HTTP API — liveness,
+identify, program — works on any board; see [HTTP control API](#http-control-api).
 
 ## Board-specific pin map (the original board)
 
@@ -147,7 +148,7 @@ storage-side cause of exactly that symptom.
 
 ## esprobe: a probe-rs probe
 
-The host tool is `host/esprobe`. It is a probe-rs *backend*, not a
+The host tool is [`crates/esprobe`](../esprobe). It is a probe-rs *backend*, not a
 reimplementation: ADIv5, the vendor debug sequences, the chip database and the
 CMSIS-Pack flash algorithms are all probe-rs's, reached through the standard
 `DebugProbe`/`RawDapAccess` traits. Programming an STM32G071 needed no
@@ -291,7 +292,7 @@ The included host adapter implements probe-rs's raw ARM DAP interface over a
 versioned COBS/CRC16 serial protocol:
 
 ```bash
-cd host/esprobe
+cd ../esprobe
 cargo run -- lines
 cargo run -- reset-lines
 cargo run -- reset-assert
@@ -507,8 +508,8 @@ Raise the clock only after repeated identity reads succeed on the assembled
 board; through the analog switch the mux settling time, not the engine, sets the
 ceiling.
 
-At boot, GPIO5 display TX, GPIO7 `RESET_ALL`, GPIO4 SWDIO, and GPIO3 SWCLK
-remain inputs. The mux selectors use the all-low STM32 position. Any operation
+On the original board, at boot GPIO5 display TX, GPIO7 `RESET_ALL`, GPIO4
+SWDIO, and GPIO3 SWCLK remain inputs. The mux selectors use the all-low STM32 position. Any operation
 that would drive a high level first reselects STM32 and requires its released
 SWDIO pull-up to be visible. Display TX is enabled only for the duration of a
 power-gated transmission, and GPIO7 asserts reset low before returning to an
@@ -516,27 +517,42 @@ input so the carrier board's 10 kΩ pull-up performs the release.
 
 `--port` defaults to the only attached Espressif USB Serial/JTAG device, so a
 replacement board needs no rebuild; pass it explicitly when more than one is
-connected. The `flash` command uses probe-rs's STM32G030K8
-flash algorithm, explicitly enables full readback verification, and resets the
-core only after a successful download.
+connected. `program` identifies the target from its own DBGMCU registers and
+uses probe-rs's flash algorithm for whatever it turns out to be, enables full
+readback verification, and resets the core only after a successful download.
 
 This is a probe-rs library adapter, not a CMSIS-DAP device. The stock
 `probe-rs` CLI cannot dynamically load an out-of-tree serial probe backend, so
-use `host/esprobe` for this transport. Logs and framed bridge traffic share
+use `crates/esprobe` for this transport. Logs and framed bridge traffic share
 the ESP32-C3 USB Serial/JTAG endpoint; the framing parser discards unrelated
 console output.
 
 ## HTTP control API
 
+A convenience layer over the same hardware, for scripting a probe that is
+already on the network. The bridge protocol on tcp/3333 is the real interface;
+nothing here is needed to use `esprobe`.
+
 ```bash
-curl http://CONTROL_HUB_IP/health
-curl -X POST http://CONTROL_HUB_IP/api/v1/stm32/probe
-curl --data-binary @ir-stm32.bin \
-  http://CONTROL_HUB_IP/api/v1/stm32/flash
-curl -X POST http://CONTROL_HUB_IP/api/v1/aux0/reset # compatibility path: RESET_ALL
-curl --data-binary @frame.bin \
-  http://CONTROL_HUB_IP/api/v1/display/tx
-curl http://CONTROL_HUB_IP/api/v1/display/rx --output received.bin
+curl http://PROBE_IP/health                        # address, SSID, liveness
+curl -X POST http://PROBE_IP/api/v1/stm32/probe    # identify the attached target
+curl --data-binary @firmware.bin \
+  http://PROBE_IP/api/v1/stm32/flash               # program it
+```
+
+### Endpoints specific to the board this came from
+
+This firmware grew on an carrier board that puts a analog switch analog
+multiplexer between the ESP32-C3's SWD pins and four targets, and a UART to a
+display. Those endpoints are still served, and are inert on a plain devkit —
+`RESET_ALL` is the only pin they touch that a three-wire setup has.
+
+```bash
+curl -X POST http://PROBE_IP/api/v1/mux/stm32      # point the mux at a target
+curl -X POST http://PROBE_IP/api/v1/mux/aux2        # ...or the others
+curl -X POST http://PROBE_IP/api/v1/aux0/reset     # compatibility path: RESET_ALL
+curl --data-binary @frame.bin http://PROBE_IP/api/v1/display/tx
+curl http://PROBE_IP/api/v1/display/rx --output received.bin
 ```
 
 The flash endpoint accepts a raw binary linked at `0x08000000`, rejects empty
