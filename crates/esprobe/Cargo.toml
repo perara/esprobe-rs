@@ -6,6 +6,14 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[lib]
+name = "esprobe"
+path = "src/lib.rs"
+
+[[bin]]
+name = "esprobe"
+path = "src/main.rs"
+
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }

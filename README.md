@@ -80,6 +80,21 @@ cargo install --path crates/esprobe     # or: cargo build --release
 firmware is a separate cross-compiled build; see
 [the firmware README](crates/esprobe-firmware/README.md).
 
+## Using it as a library
+
+The probe-rs backend is the point of this crate, so it is a library as well as
+a binary. Anything that wants a probe on the far side of a network can offer
+the bridge alongside probe-rs's own drivers:
+
+```rust
+use probe_rs::probe::list::Lister;
+
+let lister = Lister::with_lister(Box::new(esprobe::factory::EspBridgeLister::new()));
+for probe in lister.list_all() {
+    println!("{}", probe.identifier);
+}
+```
+
 ## Layout
 
 - `crates/esprobe` — the CLI and the probe-rs probe backend
