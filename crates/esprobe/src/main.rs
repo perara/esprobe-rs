@@ -51,7 +51,8 @@ struct Args {
     /// Tell the bridge that SWDIO and SWCLK are crossed on the harness.
     #[arg(long)]
     swap_swd: bool,
-    /// Print probe-rs's own trace; RUST_LOG overrides the level.
+    /// Trace probe-rs and this bridge. `RUST_LOG=esprobe=trace` adds every
+    /// protocol frame; `RUST_LOG` overrides the level entirely.
     #[arg(long, short)]
     verbose: bool,
     /// Issue one register transfer per word instead of batched blocks.
@@ -71,6 +72,84 @@ enum Engine {
     Hardware,
     /// The CPU drives every edge.
     BitBang,
+}
+
+/// Stopping, starting and inspecting the target's core.
+///
+/// Everything here is probe-rs's `Core`, reached through this bridge. The
+/// point of the subcommand is that a probe you can only flash is not a debug
+/// probe: halting, stepping and reading registers is what makes one.
+#[derive(Subcommand)]
+enum CoreAction {
+    /// Report whether the core is running, halted, or sleeping, and why.
+    Status,
+    /// Halt the core and report where it stopped.
+    Halt,
+    /// Resume a halted core.
+    Run,
+    /// Execute instructions one at a time, reporting the address after each.
+    Step {
+        #[arg(long, default_value_t = 1)]
+        count: usize,
+    },
+    /// Reset the core and catch it before it runs a single instruction.
+    ResetHalt,
+    /// Let a halted core run from a reset vector.
+    Reset,
+    /// Dump every core register the architecture defines.
+    Registers,
+    /// Read words from the target's address space.
+    Read {
+        #[arg(value_parser = parse_address)]
+        address: u64,
+        #[arg(long, default_value_t = 1)]
+        words: usize,
+    },
+    /// Write one or more words to the target's address space.
+    Write {
+        #[arg(value_parser = parse_address)]
+        address: u64,
+        #[arg(value_parser = parse_address, num_args = 1.., required = true)]
+        values: Vec<u64>,
+    },
+    /// Resume until the core reaches an address, then report where it stopped.
+    ///
+    /// The breakpoint is set, the core resumed and the halt awaited inside one
+    /// session, which is the only way it can work: every invocation of this
+    /// tool attaches and detaches, so a breakpoint set by one command is gone
+    /// before the next can run to it.
+    RunTo {
+        #[arg(value_parser = parse_address)]
+        address: u64,
+        #[arg(long, default_value_t = 5000)]
+        timeout_ms: u64,
+    },
+    /// Set a hardware breakpoint. See `run-to` for one that can be reached.
+    BreakSet {
+        #[arg(value_parser = parse_address)]
+        address: u64,
+    },
+    /// Clear a hardware breakpoint.
+    BreakClear {
+        #[arg(value_parser = parse_address)]
+        address: u64,
+    },
+    /// Report how many hardware breakpoint units the core has.
+    BreakInfo,
+}
+
+/// Accepts `0x`-prefixed hex as well as decimal, because addresses are written
+/// in hex everywhere else a person meets them.
+fn parse_address(text: &str) -> Result<u64, String> {
+    let trimmed = text.trim();
+    let parsed = match trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        Some(hex) => u64::from_str_radix(hex, 16),
+        None => trimmed.parse(),
+    };
+    parsed.map_err(|error| format!("{text:?} is not an address: {error}"))
 }
 
 /// Network provisioning, done over whichever link is already connected.
@@ -189,6 +268,22 @@ enum Action {
     /// Read or change the network the bridge joins.
     #[command(subcommand)]
     Wifi(WifiAction),
+    /// Halt, step and inspect the target's core.
+    #[command(subcommand)]
+    Core(CoreAction),
+    /// Stream the target's RTT output.
+    Rtt {
+        /// Look for the control block at this exact address instead of
+        /// scanning RAM, which is faster and avoids a false match.
+        #[arg(long, value_parser = parse_address)]
+        control_block: Option<u64>,
+        /// Stop after this long with no new data. Omit to stream until Ctrl-C.
+        #[arg(long)]
+        idle_ms: Option<u64>,
+        /// Read only this channel; by default every up channel is streamed.
+        #[arg(long)]
+        channel: Option<usize>,
+    },
     /// Read the target's identity registers and say what it actually is.
     Identify,
     /// Report the GPIO map the running firmware was built for.
@@ -271,7 +366,11 @@ fn main() -> Result<()> {
         tracing_subscriber::fmt()
             .with_env_filter(
                 tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| "probe_rs=debug".into()),
+                    // Both halves by default. The bridge's own frames are at
+                    // trace: `RUST_LOG=esprobe=trace` shows every request and
+                    // reply, which is what tells a wire fault apart from a
+                    // transport one.
+                    .unwrap_or_else(|_| "probe_rs=debug,esprobe=debug".into()),
             )
             .with_writer(std::io::stderr)
             .init();
@@ -823,6 +922,8 @@ fn main() -> Result<()> {
         }
         Action::Probe
         | Action::ProbeUnderReset
+        | Action::Core(_)
+        | Action::Rtt { .. }
         | Action::Flash { .. }
         | Action::Program { .. }
         | Action::Dump { .. }
@@ -953,6 +1054,16 @@ fn main() -> Result<()> {
         }
         Action::EnterRomBoot => {
             unreachable!("ROM boot command returned before probe attachment")
+        }
+        Action::Core(action) => {
+            run_core(&mut session, &action)?;
+        }
+        Action::Rtt {
+            control_block,
+            idle_ms,
+            channel,
+        } => {
+            run_rtt(&mut session, control_block, idle_ms, channel)?;
         }
         Action::Probe => {
             let mut core = session.core(0)?;
@@ -1310,6 +1421,217 @@ fn wait_or_stop(duration: Duration, stop: &AtomicBool) {
     }
 }
 
+/// Streams whatever the target is writing to its RTT up channels.
+///
+/// RTT is a ring buffer in the target's own RAM with a signature the host
+/// scans for, so it needs no extra wires and no cooperation from the core
+/// beyond firmware that uses it. This is what makes a debug probe useful for
+/// printf-style work rather than only for stopping and starting.
+fn run_rtt(
+    session: &mut probe_rs::Session,
+    control_block: Option<u64>,
+    idle_ms: Option<u64>,
+    channel: Option<usize>,
+) -> Result<()> {
+    let memory_map = session.target().memory_map.clone();
+    let mut core = session.core(0)?;
+    let region = match control_block {
+        Some(address) => probe_rs::rtt::ScanRegion::Exact(address),
+        None => probe_rs::rtt::ScanRegion::Ram,
+    };
+    let mut rtt = probe_rs::rtt::Rtt::attach_region(&mut core, &region).with_context(|| {
+        match control_block {
+            Some(address) => format!("no RTT control block at {address:#010x}"),
+            None => format!(
+                "no RTT control block found in the {} RAM regions probe-rs knows for this target; \
+                 pass --control-block if the firmware places it somewhere unusual",
+                memory_map.len()
+            ),
+        }
+    })?;
+
+    let channels: Vec<usize> = rtt
+        .up_channels()
+        .iter()
+        .map(|up| up.number())
+        .filter(|number| channel.is_none_or(|wanted| wanted == *number))
+        .collect();
+    if channels.is_empty() {
+        bail!("the control block declares no matching up channel");
+    }
+    for up in rtt.up_channels().iter() {
+        eprintln!(
+            "channel {} {:?} buffer={} bytes{}",
+            up.number(),
+            up.name().unwrap_or("(unnamed)"),
+            up.buffer_size(),
+            if channels.contains(&up.number()) {
+                ""
+            } else {
+                " (skipped)"
+            }
+        );
+    }
+
+    let mut buffer = [0u8; 1024];
+    let mut idle_since = Instant::now();
+    let mut total = 0usize;
+    loop {
+        let mut moved = false;
+        for up in rtt.up_channels().iter_mut() {
+            if !channels.contains(&up.number()) {
+                continue;
+            }
+            let read = up.read(&mut core, &mut buffer)?;
+            if read == 0 {
+                continue;
+            }
+            moved = true;
+            total += read;
+            // Straight through, bytes as they came: RTT carries whatever the
+            // firmware wrote, which is not always valid UTF-8 mid-buffer.
+            use std::io::Write as _;
+            let mut out = std::io::stdout();
+            out.write_all(&buffer[..read])?;
+            out.flush()?;
+        }
+        if moved {
+            idle_since = Instant::now();
+        } else if let Some(idle_ms) = idle_ms
+            && idle_since.elapsed() >= Duration::from_millis(idle_ms)
+        {
+            eprintln!("\nidle for {idle_ms} ms; {total} bytes read");
+            return Ok(());
+        }
+        if !moved {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+/// Stops, starts and inspects the target's core.
+fn run_core(session: &mut probe_rs::Session, action: &CoreAction) -> Result<()> {
+    let mut core = session.core(0)?;
+    // Long enough for a core that is asleep or waiting on a slow bus, short
+    // enough that a target which will never halt says so rather than hanging.
+    let timeout = Duration::from_millis(500);
+    match action {
+        CoreAction::Status => println!("status={:?}", core.status()?),
+        CoreAction::Halt => {
+            let information = core.halt(timeout)?;
+            println!("halted pc={:#010x}", information.pc);
+        }
+        CoreAction::Run => {
+            core.run()?;
+            println!("running");
+        }
+        CoreAction::Step { count } => {
+            if !core.core_halted()? {
+                core.halt(timeout)?;
+            }
+            for index in 0..*count {
+                let information = core.step()?;
+                println!("step={} pc={:#010x}", index + 1, information.pc);
+            }
+        }
+        CoreAction::ResetHalt => {
+            let information = core.reset_and_halt(timeout)?;
+            println!("reset and halted pc={:#010x}", information.pc);
+        }
+        CoreAction::Reset => {
+            core.reset()?;
+            println!("reset and running");
+        }
+        CoreAction::Registers => {
+            // Halted first: reading a register of a running core reports
+            // whatever it happened to contain mid-instruction, which is worse
+            // than refusing.
+            let was_running = !core.core_halted()?;
+            if was_running {
+                core.halt(timeout)?;
+            }
+            for register in core.registers().all_registers() {
+                match core.read_core_reg::<u64>(register.id()) {
+                    Ok(value) => println!("{:<12} {value:#018x}", register.name()),
+                    Err(error) => println!("{:<12} unavailable ({error})", register.name()),
+                }
+            }
+            if was_running {
+                core.run()?;
+            }
+        }
+        CoreAction::Read { address, words } => {
+            let mut buffer = vec![0u32; *words];
+            core.read_32(*address, &mut buffer)?;
+            for (index, word) in buffer.iter().enumerate() {
+                println!("{:#010x} {word:#010x}", address + (index * 4) as u64);
+            }
+        }
+        CoreAction::Write { address, values } => {
+            let words: Vec<u32> = values.iter().map(|value| *value as u32).collect();
+            core.write_32(*address, &words)?;
+            // Read back rather than trust the write: a word that lands in
+            // unmapped or write-protected space fails silently on this bus.
+            let mut read_back = vec![0u32; words.len()];
+            core.read_32(*address, &mut read_back)?;
+            for (index, (wrote, read)) in words.iter().zip(read_back.iter()).enumerate() {
+                let at = address + (index * 4) as u64;
+                let note = if wrote == read { "" } else { "  MISMATCH" };
+                println!("{at:#010x} wrote {wrote:#010x} reads {read:#010x}{note}");
+            }
+            if words != read_back {
+                bail!("the target did not take every word");
+            }
+        }
+        CoreAction::RunTo {
+            address,
+            timeout_ms,
+        } => {
+            if !core.core_halted()? {
+                core.halt(timeout)?;
+            }
+            core.set_hw_breakpoint(*address)?;
+            core.run()?;
+            let deadline = Instant::now() + Duration::from_millis(*timeout_ms);
+            let reached = loop {
+                if core.core_halted()? {
+                    break true;
+                }
+                if Instant::now() >= deadline {
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            };
+            // Cleared either way: leaving a unit armed in the core's flash
+            // patch block outlives this process and surprises the next one.
+            let cleared = core.clear_hw_breakpoint(*address);
+            if !reached {
+                cleared?;
+                bail!("the core did not reach {address:#010x} within {timeout_ms} ms");
+            }
+            let program_counter = core.program_counter().id();
+            let pc = core.read_core_reg::<u64>(program_counter)?;
+            cleared?;
+            println!("halted at breakpoint pc={pc:#010x}");
+        }
+        CoreAction::BreakSet { address } => {
+            core.set_hw_breakpoint(*address)?;
+            println!("breakpoint set at {address:#010x}");
+        }
+        CoreAction::BreakClear { address } => {
+            core.clear_hw_breakpoint(*address)?;
+            println!("breakpoint cleared at {address:#010x}");
+        }
+        CoreAction::BreakInfo => {
+            println!(
+                "hardware breakpoint units={}",
+                core.available_breakpoint_units()?
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Reads or changes the network the bridge joins.
 fn run_wifi(serial: &mut SerialDapProbe, action: &WifiAction) -> Result<()> {
     match action {
@@ -1434,11 +1756,19 @@ impl Transport {
             .map_err(|_| anyhow::anyhow!("request is too large"))?;
         self.port.write_all(&[0])?;
         self.port.write_all(&request[..request_len])?;
+        tracing::trace!(
+            sequence,
+            ?command,
+            payload = payload.len(),
+            framed = request_len,
+            "request"
+        );
         Ok(sequence)
     }
 
     fn receive(&mut self, sequence: u16) -> Result<Vec<u8>> {
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(3);
         // One read syscall per frame rather than per packet. A 4 KiB reply took
         // nine calls at 512 bytes, and their latency lands squarely between the
         // reply arriving and the next request going out.
@@ -1451,16 +1781,33 @@ impl Transport {
                 if frame.is_empty() {
                     continue;
                 }
-                if let Ok(response) = decode_response(&mut frame)
-                    && response.sequence == sequence
-                {
-                    return match response.status {
-                        Status::Ok => Ok(response.payload.to_vec()),
-                        status => {
-                            bail!("bridge status {status:?}, detail={:02x?}", response.payload)
-                        }
-                    };
+                let decoded = decode_response(&mut frame);
+                let Ok(response) = decoded else {
+                    tracing::trace!(bytes = frame.len(), "discarded an undecodable frame");
+                    continue;
+                };
+                if response.sequence != sequence {
+                    // Ordinary while a reply for an abandoned request drains.
+                    tracing::trace!(
+                        got = response.sequence,
+                        want = sequence,
+                        "reply for another request"
+                    );
+                    continue;
                 }
+                tracing::trace!(
+                    sequence,
+                    status = ?response.status,
+                    payload = response.payload.len(),
+                    micros = started.elapsed().as_micros(),
+                    "reply"
+                );
+                return match response.status {
+                    Status::Ok => Ok(response.payload.to_vec()),
+                    status => {
+                        bail!("bridge status {status:?}, detail={:02x?}", response.payload)
+                    }
+                };
             }
             if Instant::now() >= deadline {
                 break;
@@ -1496,6 +1843,11 @@ impl Transport {
                 self.pending.clear();
             }
         }
+        tracing::debug!(
+            sequence,
+            buffered = self.pending.len(),
+            "no reply within the deadline"
+        );
         bail!("bridge response timeout")
     }
 }
