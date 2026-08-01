@@ -175,6 +175,29 @@ impl<'session> ProbeTarget<'session> {
         })
     }
 
+    /// Runs one probe operation, retrying it once.
+    ///
+    /// Rapidly halting and restarting a core provokes the occasional SWD
+    /// protocol error — an ACK of 0b111, the target not driving a response.
+    /// It is transient and a second attempt clears it, but a debug session
+    /// makes thousands of transactions, so over any real session one is close
+    /// to certain, and every one of them used to end the session.
+    fn retrying<T>(
+        &mut self,
+        mut operation: impl FnMut(&mut Core<'_>) -> Result<T, probe_rs::Error>,
+    ) -> Result<T, probe_rs::Error> {
+        match operation(&mut self.core) {
+            Ok(value) => Ok(value),
+            Err(first) => {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                operation(&mut self.core).map_err(|second| {
+                    tracing::debug!(?first, ?second, "probe operation failed twice");
+                    second
+                })
+            }
+        }
+    }
+
     fn add_breakpoint(&mut self, address: u64) -> TargetResult<bool, Self> {
         if self.breakpoints.contains(&address) {
             return Ok(true);
@@ -184,8 +207,7 @@ impl<'session> ProbeTarget<'session> {
             // insert breakpoint". Better than accepting it and never stopping.
             return Ok(false);
         }
-        self.core
-            .set_hw_breakpoint(address)
+        self.retrying(|core| core.set_hw_breakpoint(address))
             .map_err(TargetError::Fatal)?;
         self.breakpoints.push(address);
         Ok(true)
@@ -195,8 +217,7 @@ impl<'session> ProbeTarget<'session> {
         let Some(index) = self.breakpoints.iter().position(|held| *held == address) else {
             return Ok(false);
         };
-        self.core
-            .clear_hw_breakpoint(address)
+        self.retrying(|core| core.clear_hw_breakpoint(address))
             .map_err(TargetError::Fatal)?;
         self.breakpoints.remove(index);
         Ok(true)
@@ -221,33 +242,28 @@ impl SingleThreadBase for ProbeTarget<'_> {
     fn read_registers(&mut self, regs: &mut CortexMRegs) -> TargetResult<(), Self> {
         for (index, slot) in regs.r.iter_mut().enumerate() {
             *slot = self
-                .core
-                .read_core_reg(RegisterId(index as u16))
+                .retrying(|core| core.read_core_reg(RegisterId(index as u16)))
                 .map_err(TargetError::Fatal)?;
         }
         regs.sp = self
-            .core
-            .read_core_reg(RegisterId(SP))
+            .retrying(|core| core.read_core_reg(RegisterId(SP)))
             .map_err(TargetError::Fatal)?;
         regs.lr = self
-            .core
-            .read_core_reg(RegisterId(LR))
+            .retrying(|core| core.read_core_reg(RegisterId(LR)))
             .map_err(TargetError::Fatal)?;
         regs.pc = self
-            .core
-            .read_core_reg(RegisterId(PC))
+            .retrying(|core| core.read_core_reg(RegisterId(PC)))
             .map_err(TargetError::Fatal)?;
         regs.xpsr = self
-            .core
-            .read_core_reg(RegisterId(XPSR))
+            .retrying(|core| core.read_core_reg(RegisterId(XPSR)))
             .map_err(TargetError::Fatal)?;
         Ok(())
     }
 
     fn write_registers(&mut self, regs: &CortexMRegs) -> TargetResult<(), Self> {
         for (index, value) in regs.r.iter().enumerate() {
-            self.core
-                .write_core_reg(RegisterId(index as u16), *value)
+            let value = *value;
+            self.retrying(|core| core.write_core_reg(RegisterId(index as u16), value))
                 .map_err(TargetError::Fatal)?;
         }
         for (id, value) in [
@@ -256,8 +272,7 @@ impl SingleThreadBase for ProbeTarget<'_> {
             (PC, regs.pc),
             (XPSR, regs.xpsr),
         ] {
-            self.core
-                .write_core_reg(RegisterId(id), value)
+            self.retrying(|core| core.write_core_reg(RegisterId(id), value))
                 .map_err(TargetError::Fatal)?;
         }
         Ok(())
@@ -267,15 +282,14 @@ impl SingleThreadBase for ProbeTarget<'_> {
         // A read GDB cannot satisfy is routine — it probes around the stack
         // and past the end of mapped memory while unwinding — so a failure
         // here is reported as "no data" rather than killing the session.
-        match self.core.read(u64::from(start_addr), data) {
+        match self.retrying(|core| core.read(u64::from(start_addr), data)) {
             Ok(()) => Ok(data.len()),
             Err(_) => Ok(0),
         }
     }
 
     fn write_addrs(&mut self, start_addr: u32, data: &[u8]) -> TargetResult<(), Self> {
-        self.core
-            .write(u64::from(start_addr), data)
+        self.retrying(|core| core.write(u64::from(start_addr), data))
             .map_err(TargetError::Fatal)
     }
 
@@ -326,7 +340,7 @@ impl SingleRegisterAccess<()> for ProbeTarget<'_> {
 
 impl SingleThreadResume for ProbeTarget<'_> {
     fn resume(&mut self, _signal: Option<Signal>) -> Result<(), Self::Error> {
-        self.core.run()
+        self.retrying(|core| core.run())
     }
 
     #[inline(always)]
@@ -336,8 +350,35 @@ impl SingleThreadResume for ProbeTarget<'_> {
 }
 
 impl SingleThreadSingleStep for ProbeTarget<'_> {
+    /// Steps one instruction, disarming any breakpoint on the instruction
+    /// being stepped over.
+    ///
+    /// Stepping off an address that still has a hardware unit pointed at it
+    /// makes the core halt on the breakpoint again instead of advancing, and
+    /// probe-rs only handles that itself when its cached halt reason says
+    /// "breakpoint" — which it does not when the halt was observed by polling
+    /// rather than requested. Left alone, a source-level `step` in GDB, which
+    /// is many instruction steps, failed with an ARM error and took the whole
+    /// session down with it.
     fn step(&mut self, _signal: Option<Signal>) -> Result<(), Self::Error> {
-        self.core.step().map(|_| ())
+        let pc: u64 = self.retrying(|core| core.read_core_reg(RegisterId(PC)))?;
+        let armed = self.breakpoints.contains(&pc);
+        if armed {
+            self.retrying(|core| core.clear_hw_breakpoint(pc))?;
+        }
+        // Retried once. Rapidly halting and restarting a core provokes the
+        // occasional SWD protocol error — an ACK of 0b111, the target not
+        // driving a response — and a source-level `step` is many instruction
+        // steps, so over a long session one is close to certain. Losing the
+        // whole debug session to a transient that a second attempt clears is
+        // the wrong trade.
+        let stepped = self.retrying(|core| core.step()).map(|_| ());
+        if armed {
+            // Re-armed even if the step failed, so the breakpoint GDB believes
+            // in still exists.
+            self.retrying(|core| core.set_hw_breakpoint(pc))?;
+        }
+        stepped
     }
 }
 
@@ -401,11 +442,21 @@ impl<'session> BlockingEventLoop for ProbeEventLoop<'session> {
             // The core is polled rather than interrupt-driven: SWD has no way
             // to notify, so stopping is only ever observed by asking.
             let halted = target
-                .core
-                .core_halted()
+                .retrying(|core| core.core_halted())
                 .map_err(WaitForStopReasonError::Target)?;
             if halted {
-                return Ok(Event::TargetStopped(SingleThreadStopReason::SwBreak(())));
+                // Refreshes probe-rs's cached halt reason as a side effect,
+                // which its own stepping logic consults.
+                let reason = target
+                    .retrying(|core| core.status())
+                    .map_err(WaitForStopReasonError::Target)?;
+                let stop = match reason {
+                    probe_rs::CoreStatus::Halted(probe_rs::HaltReason::Breakpoint(_)) => {
+                        SingleThreadStopReason::SwBreak(())
+                    }
+                    _ => SingleThreadStopReason::Signal(Signal::SIGTRAP),
+                };
+                return Ok(Event::TargetStopped(stop));
             }
             if conn
                 .peek()
@@ -422,12 +473,16 @@ impl<'session> BlockingEventLoop for ProbeEventLoop<'session> {
     fn on_interrupt(
         target: &mut Self::Target,
     ) -> Result<Option<Self::StopReason>, <Self::Target as Target>::Error> {
-        target.core.halt(HALT_TIMEOUT)?;
+        target.retrying(|core| core.halt(HALT_TIMEOUT))?;
         Ok(Some(SingleThreadStopReason::Signal(Signal::SIGINT)))
     }
 }
 
-/// Serves one GDB session on `port` for as long as the debugger stays attached.
+/// Serves GDB sessions on `port` until interrupted.
+///
+/// Successive sessions rather than one: a debugger that disconnects, or a
+/// session lost to a wire fault, would otherwise mean restarting the server
+/// and re-attaching the probe.
 pub fn serve(session: &mut Session, port: u16, halt_first: bool, slow_link: bool) -> Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", port))
         .with_context(|| format!("failed to listen on port {port}"))?;
@@ -441,10 +496,19 @@ pub fn serve(session: &mut Session, port: u16, halt_first: bool, slow_link: bool
         eprintln!("this bridge is on the network: run `set remotetimeout 30` before connecting");
     }
 
-    let (stream, peer) = listener.accept().context("failed to accept a debugger")?;
-    stream.set_nodelay(true)?;
-    eprintln!("debugger attached from {peer}");
+    loop {
+        let (stream, peer) = listener.accept().context("failed to accept a debugger")?;
+        stream.set_nodelay(true)?;
+        eprintln!("debugger attached from {peer}");
+        if let Err(error) = serve_one(session, stream, halt_first) {
+            eprintln!("session ended with an error: {error:#}");
+        }
+        eprintln!("waiting for the next debugger on tcp/{port}");
+    }
+}
 
+/// One attach, from the debugger connecting to it going away again.
+fn serve_one(session: &mut Session, stream: TcpStream, halt_first: bool) -> Result<()> {
     let mut core = session.core(0)?;
     if halt_first {
         // GDB expects to be talking to a stopped program the moment it

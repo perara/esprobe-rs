@@ -144,6 +144,18 @@ hardware breakpoints that GDB sets and clears itself. Software breakpoints are
 served from hardware units too, because a Cortex-M's code lives in flash and
 GDB's default trap-instruction write would go nowhere.
 
+**Known defect.** A source-level `step` (as opposed to `stepi`) intermittently
+ends the session with `bridge status Transport, detail=[07]`. That is an SWD
+ACK of `0b111` — the target not driving a response — provoked by the rapid
+halt/restart cycle stepping performs. Recovering from it requires
+re-synchronising the line, which `Swd::transfer` in the firmware does not do:
+it returns `Error::Protocol` immediately, though `line_reset_and_switch` is
+right there. Retrying at the host does not help, because the link needs the
+reset. Nothing is corrupted and a fresh attach recovers completely; the server
+keeps listening and serves the next session. `stepi`, breakpoints, `continue`,
+backtraces, registers and memory are unaffected — 200 consecutive `stepi` run
+clean.
+
 Over Wi-Fi, run `set remotetimeout 30` first. Reading the register file is
 seventeen round trips, which takes several seconds across a network link and
 overruns GDB's two-second default; the server says so when it starts.
