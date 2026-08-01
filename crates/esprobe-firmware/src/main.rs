@@ -1920,17 +1920,29 @@ mod app {
             // moves between networks — a field baked in at boot answered
             // 0.0.0.0 for the life of the process, which is worse than absent
             // for anything discovering probes by polling this.
-            let (ssid, ip) = match wifi.lock() {
+            // A poisoned lock means a thread died holding the radio state, so
+            // this answers no rather than reporting a healthy probe with an
+            // unknown address — an endpoint that cannot fail is not a health
+            // check.
+            let (ok, ssid, ip) = match wifi.lock() {
                 Ok(state) => (
+                    true,
                     state.ssid.clone(),
                     std::net::Ipv4Addr::from(state.ip).to_string(),
                 ),
-                Err(_) => (String::new(), String::from("0.0.0.0")),
+                Err(_) => (false, String::new(), String::from("0.0.0.0")),
             };
+            // The SSID is whatever the network is called, which 802.11 leaves
+            // wide open and the credential codec only checks for UTF-8.
             let body = format!(
-                "{{\"ok\":true,\"service\":\"esprobe\",\"ip\":\"{ip}\",\"ssid\":\"{ssid}\"}}\n"
+                "{{\"ok\":{ok},\"service\":\"esprobe\",\"ip\":\"{ip}\",\"ssid\":\"{}\"}}\n",
+                esprobe_protocol::json::Escaped(&ssid)
             );
-            req.into_ok_response()?.write_all(body.as_bytes())?;
+            let mut response = match ok {
+                true => req.into_ok_response()?,
+                false => req.into_status_response(503)?,
+            };
+            response.write_all(body.as_bytes())?;
             Ok::<(), anyhow::Error>(())
         })?;
 
