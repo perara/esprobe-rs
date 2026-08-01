@@ -479,11 +479,26 @@ impl SwdIo for EspSwdIo<'_> {
             let data = self.read_data_phase();
             return ack | data << 3;
         }
-        // ACK, data, parity and both turnaround clocks in one transaction:
-        // three peripheral round trips per word become two, and on this bus
-        // the sequencing costs far more than the clocks.
+        // The acknowledgement first, on its own. Fusing it with the data
+        // phase — ACK, data, parity and both turnarounds in one transaction —
+        // is faster, and was how this worked, but it clocks a data phase that
+        // a target answering anything other than OK is not driving. Thirty-five
+        // stray clocks into a debug port desynchronise it: every transfer
+        // afterwards returns a protocol error, and only re-attaching clears
+        // it. The bit-bang engine above always checked first; this one did
+        // not, and it is the default.
+        //
+        // Faults are not exotic. A debugger reads unmapped addresses whenever
+        // it unwinds a stack, so a source-level step provoked one about every
+        // other session, and this is what turned that into a dead session.
         self.select_driver(Driver::Spi);
-        self.spi.read_bits(38)
+        let ack = self.spi.read_bits(3);
+        if ack as u8 & 0b111 != ok {
+            self.trailing_turnaround();
+            return ack;
+        }
+        let rest = self.spi.read_bits(35);
+        ack | rest << 3
     }
 
     fn end_transfer(&mut self) {

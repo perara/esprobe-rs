@@ -23,8 +23,9 @@ Verified against an STM32G071 and an STM32F407 over USB:
 | --- | ---: |
 | Identify, attach, connect-under-reset | works |
 | Program, with backup and read-back verification | works |
-| Bulk read, 8 MHz default wire clock | 333 KiB/s |
-| Bulk read, `--speed-khz 16000` | 456 KiB/s |
+| Source-level stepping, breakpoints, backtraces | works |
+| Bulk read, 8 MHz default wire clock | 312 KiB/s |
+| Bulk read, `--speed-khz 16000` | 428 KiB/s |
 
 The wire is the limit, not the transport: raising `--depth` moves the bulk
 figure by about one percent, and raising the clock moves it proportionally.
@@ -158,27 +159,6 @@ through the bridge: registers, memory, Thumb disassembly, single-stepping, and
 hardware breakpoints that GDB sets and clears itself. Software breakpoints are
 served from hardware units too, because a Cortex-M's code lives in flash and
 GDB's default trap-instruction write would go nowhere.
-
-**Known defect.** A source-level `step` (as opposed to `stepi`) intermittently
-ends the session with `bridge status Transport, detail=[07]` — an SWD ACK of
-`0b111`, the target not driving a response, provoked by the rapid halt and
-restart that stepping performs. Roughly every other session hits it.
-
-It is not a firmware bug, and not fixable by retrying. probe-rs drives this
-probe through raw DAP access, which means probe-rs — not the firmware — owns
-the `SELECT` and `CSW` state. Re-synchronising the line in `Swd::transfer`,
-which is where it first looked like it belonged, would clear that state while
-the host still believed its cached copy, and the retried access would land in
-the wrong bank: a wrong answer rather than an error, which is the worst thing
-a debug probe can do. Recovery has to be driven by whoever owns the
-sequencing.
-
-So the server does the only safe thing and attaches again. A failed session
-reports the error, drops the probe-rs session, re-attaches, and goes back to
-listening; the debugger reconnects rather than the operator restarting
-anything. Nothing is corrupted, and the target keeps running throughout.
-`stepi`, breakpoints, `continue`, backtraces, registers and memory are
-unaffected — 200 consecutive `stepi` run clean.
 
 Over Wi-Fi, run `set remotetimeout 30` first. Reading the register file is
 seventeen round trips, which takes several seconds across a network link and
