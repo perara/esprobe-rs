@@ -37,7 +37,9 @@ esprobe wifi forget                  # falls back to the probe's own access poin
 ```
 
 Credentials live in NVS on the device, so they survive a power cycle and a
-reflash, and no image ever carries a passphrase.
+reflash, and no image carries the passphrase of a network you join. The
+fallback access point's own password is the one thing compiled in, so treat a
+built image as carrying that.
 
 ### Status of the network transport
 
@@ -58,6 +60,18 @@ Round trips over Wi-Fi run 60–160 ms against a gateway that answers in 0.3 ms,
 which is that board's marginal link retrying, not the bridge. USB stays the
 faster transport by a wide margin; the network one is for a board on a bench
 you are not sitting at.
+
+## Installing
+
+```bash
+git clone https://github.com/perara/esprobe-rs
+cd esprobe-rs
+cargo install --path crates/esprobe     # or: cargo build --release
+```
+
+`cargo build --release` leaves the binary at `target/release/esprobe`. The
+firmware is a separate cross-compiled build; see
+[the firmware README](crates/esprobe-firmware/README.md).
 
 ## Layout
 

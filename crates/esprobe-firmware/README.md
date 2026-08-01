@@ -16,6 +16,11 @@ cp wifi.env.example .env.local     # then fill it in; never commit it
 espflash flash --monitor target/riscv32imc-esp-espidf/release/esprobe-firmware
 ```
 
+`.env.local` needs `WIFI_COUNTRY` — the two-letter regulatory domain this probe
+will be used in — plus the fallback access point's name and password. The build
+refuses to run without them. `WIFI_COUNTRY` is deliberately not defaulted: see
+the diagnostics section below for what world-safe mode does to this chip.
+
 Wi-Fi is optional. Without a board link the bridge still works over USB, and
 the SoftAP keeps it reachable when no infrastructure network is.
 

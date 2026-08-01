@@ -14,6 +14,7 @@ set -a
 source "${secrets_file}"
 set +a
 
+: "${WIFI_COUNTRY:?WIFI_COUNTRY is required: the two-letter regulatory domain this probe will be used in. Without one the radio starts in world-safe mode, where this chip receives but does not transmit.}"
 : "${CONTROL_AP_SSID:?CONTROL_AP_SSID is required}"
 : "${CONTROL_AP_PASSWORD:?CONTROL_AP_PASSWORD is required}"
 

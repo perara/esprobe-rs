@@ -32,8 +32,7 @@ pub fn decode(payload: &[u8]) -> Option<(&str, &str)> {
     };
     let ssid_len = usize::from(*ssid_len);
     let password_len = usize::from(*password_len);
-    if ssid_len > MAX_SSID || password_len > MAX_PASSWORD || rest.len() != ssid_len + password_len
-    {
+    if ssid_len > MAX_SSID || password_len > MAX_PASSWORD || rest.len() != ssid_len + password_len {
         return None;
     }
     let (ssid, password) = rest.split_at(ssid_len);
@@ -50,8 +49,12 @@ mod tests {
     #[test]
     fn credentials_survive_the_round_trip() {
         let mut buffer = [0u8; 128];
-        let length = encode("an ssid with spaces", "p@ss:w0rd#with,punctuation", &mut buffer)
-            .expect("encodes");
+        let length = encode(
+            "an ssid with spaces",
+            "p@ss:w0rd#with,punctuation",
+            &mut buffer,
+        )
+        .expect("encodes");
         let (ssid, password) = decode(&buffer[..length]).expect("decodes");
         assert_eq!(ssid, "an ssid with spaces");
         assert_eq!(password, "p@ss:w0rd#with,punctuation");
@@ -72,4 +75,3 @@ mod tests {
         assert_eq!(decode(&[1, 1, b'a']), None);
     }
 }
-

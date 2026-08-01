@@ -1,6 +1,6 @@
 //! Framing contract for the USB-serial ARM DAP bridge.
 
-pub const VERSION: u8 = 3;
+pub const VERSION: u8 = 4;
 /// Large enough for a 256-word block read plus the envelope and worst-case
 /// COBS overhead. One USB round trip per kibibyte, rather than per word, is
 /// what keeps the wire — not the transport — the limiting factor.
@@ -325,7 +325,7 @@ mod tests {
         let length = encode_request(0x1234, Command::Hello, &[], &mut frame).unwrap();
         assert_eq!(
             &frame[..length],
-            &[11, b'E', b'S', b'P', b'B', 3, 0x34, 0x12, 1, 0xb3, 0x6f, 0],
+            &[11, b'E', b'S', b'P', b'B', 4, 0x34, 0x12, 1, 0x9e, 0x3e, 0],
             "the Hello request encoding moved"
         );
 
@@ -335,7 +335,7 @@ mod tests {
         assert_eq!(
             &frame[..length],
             &[
-                8, b'E', b'S', b'P', b'R', 3, 0x34, 0x12, 5, 0xde, 0xad, 0x88, 0xde, 0
+                8, b'E', b'S', b'P', b'R', 4, 0x34, 0x12, 5, 0xde, 0xad, 0xc9, 0x16, 0
             ],
             "the response encoding moved"
         );
@@ -346,7 +346,7 @@ mod tests {
         assert_eq!(Command::ReadRegister as u8, 0x10);
         assert_eq!(Command::MemoryRead as u8, 0x29);
         assert_eq!(Status::TargetInReset as u8, 8);
-        assert_eq!(VERSION, 3);
+        assert_eq!(VERSION, 4);
     }
 
     #[test]
