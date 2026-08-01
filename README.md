@@ -108,6 +108,11 @@ esprobe fast-dump flash.bin --size 524288
 `--port` selects a serial bridge, `--url host[:port]` a network one. Nothing
 above the transport changes between them.
 
+As a probe-rs backend the same choice is made from the selector: an address,
+an `address:port`, or a dotted name is a network bridge, and anything else is
+opened as a serial device. A single-label host is not guessed at, since
+nothing distinguishes `probe` from a device name — write `probe:3333`.
+
 ### Identify, don't assume
 
 `probe-rs attach` succeeds against whatever target name you hand it — the same

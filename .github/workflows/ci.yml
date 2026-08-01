@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  workspace:
+    name: Test, lint and format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --release
+
+  firmware-format:
+    name: Firmware formatting
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      # The firmware is excluded from the workspace and cross-compiles for
+      # riscv32imc-esp-espidf against a generated ESP-IDF, which cannot be
+      # built here; its dependencies do not compile for the host at all. Its
+      # formatting can still be checked, and is, because that is the part that
+      # otherwise drifts silently between hardware sessions.
+      - run: cargo fmt --check
+        working-directory: crates/esprobe-firmware
+
+  msrv:
+    name: Minimum supported Rust version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Must match `rust-version` in the workspace manifest. Declaring an MSRV
+      # nothing enforces is how it quietly stops being true.
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets

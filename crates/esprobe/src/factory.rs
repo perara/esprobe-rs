@@ -52,25 +52,54 @@ impl std::fmt::Display for EspBridgeFactory {
     }
 }
 
+/// Windows names its serial ports `COM1`, `COM2`, and so on.
+///
+/// These are the one device name with no path separator in it, which is what
+/// every other rule here leans on. Without this, `COM3` reads as a host and
+/// the bridge that was just enumerated cannot be opened.
+fn is_windows_com_port(name: &str) -> bool {
+    let Some(number) = name
+        .strip_prefix("COM")
+        .or_else(|| name.strip_prefix("com"))
+    else {
+        return false;
+    };
+    !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+}
+
 /// Parses a selector's serial number as a network endpoint.
 ///
-/// A bare host is accepted and given the bridge's default port, so the common
-/// case does not have to repeat it.
+/// Deliberately conservative: everything not recognised here is opened as a
+/// serial device, because misreading a port as a host produces a DNS failure
+/// reported as "probe not found", while the reverse is a clear error. A single
+/// -label host such as `probe` is therefore not guessed at — write `probe:3333`
+/// or `probe.local`.
 fn network_endpoint(serial: &str) -> Option<String> {
+    if serial.is_empty() {
+        return None;
+    }
+    // Device nodes, on every platform that has them.
+    if serial.contains('/') || serial.contains('\\') || is_windows_com_port(serial) {
+        return None;
+    }
+    // `1.2.3.4:3333` and `[::1]:3333`.
     if serial.parse::<SocketAddr>().is_ok() {
         return Some(serial.to_string());
     }
-    // A bare address is only a host if it cannot be a path; a serial device is
-    // always a path on the platforms probe-rs supports.
-    if !serial.contains('/') && !serial.contains('\\') && !serial.is_empty() {
-        let candidate = format!("{serial}:{BRIDGE_TCP_PORT}");
-        if candidate.parse::<SocketAddr>().is_ok() {
-            return Some(candidate);
-        }
-        // Host names never parse as a socket address but are still valid.
-        if serial.chars().any(|c| c.is_ascii_alphabetic()) && !serial.starts_with("/dev") {
-            return Some(candidate);
-        }
+    // `host:port`, with a port that is really a port. A bracketless IPv6
+    // address is not accepted: it is ambiguous with this form and is not
+    // something `TcpStream::connect` takes anyway.
+    if let Some((host, port)) = serial.rsplit_once(':')
+        && !host.is_empty()
+        && !host.contains(':')
+        && port.parse::<u16>().is_ok()
+    {
+        return Some(serial.to_string());
+    }
+    // A bare host, given the bridge's default port. The dot is what separates
+    // an address or a qualified name from a word that could be a device.
+    if serial.contains('.') {
+        return Some(format!("{serial}:{BRIDGE_TCP_PORT}"));
     }
     None
 }
@@ -212,6 +241,46 @@ mod tests {
         assert_eq!(network_endpoint("/dev/ttyACM0"), None);
         assert_eq!(network_endpoint("/dev/serial/by-id/usb-Espressif"), None);
         assert_eq!(network_endpoint(r"COM3\"), None);
+    }
+
+    #[test]
+    fn windows_serial_ports_are_not_hosts() {
+        // `list_probes` puts the port name in the selector, and on Windows
+        // that is a bare `COM3`. Reading it as a host made every probe this
+        // lister enumerated there impossible to open.
+        for name in ["COM1", "COM3", "COM12", "com3", r"\\.\COM12"] {
+            assert_eq!(network_endpoint(name), None, "{name} read as a host");
+        }
+    }
+
+    #[test]
+    fn qualified_hosts_and_explicit_ports_are_network_bridges() {
+        assert_eq!(
+            network_endpoint("probe.local").as_deref(),
+            Some("probe.local:3333")
+        );
+        assert_eq!(
+            network_endpoint("probe.local:4444").as_deref(),
+            Some("probe.local:4444")
+        );
+        assert_eq!(
+            network_endpoint("bench:3333").as_deref(),
+            Some("bench:3333")
+        );
+        assert_eq!(
+            network_endpoint("[::1]:3333").as_deref(),
+            Some("[::1]:3333")
+        );
+    }
+
+    #[test]
+    fn a_word_that_could_be_a_device_is_left_alone() {
+        // Nothing distinguishes a single-label host from a device name, so
+        // this errs towards serial and the docs say to qualify it.
+        assert_eq!(network_endpoint("probe"), None);
+        assert_eq!(network_endpoint(""), None);
+        // A port that is not a port does not make a host.
+        assert_eq!(network_endpoint("ttyACM0:notaport"), None);
     }
 }
 
