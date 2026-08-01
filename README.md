@@ -24,8 +24,8 @@ Verified against an STM32G071 and an STM32F407 over USB:
 | Identify, attach, connect-under-reset | works |
 | Program, with backup and read-back verification | works |
 | Source-level stepping, breakpoints, backtraces | works |
-| Bulk read, 8 MHz default wire clock | 312 KiB/s |
-| Bulk read, `--speed-khz 16000` | 428 KiB/s |
+| Bulk read, 8 MHz default wire clock | 309 KiB/s |
+| Bulk read, `--speed-khz 16000` | 408 KiB/s |
 
 The wire is the limit, not the transport: raising `--depth` moves the bulk
 figure by about one percent, and raising the clock moves it proportionally.
