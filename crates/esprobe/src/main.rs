@@ -1,4 +1,5 @@
 mod factory;
+mod gdb;
 
 use std::fmt;
 use std::path::PathBuf;
@@ -271,6 +272,14 @@ enum Action {
     /// Halt, step and inspect the target's core.
     #[command(subcommand)]
     Core(CoreAction),
+    /// Serve the GDB remote protocol, so a debugger can drive the target.
+    Gdb {
+        #[arg(long, default_value_t = 1234)]
+        port: u16,
+        /// Leave the core running instead of halting it when GDB attaches.
+        #[arg(long)]
+        no_halt: bool,
+    },
     /// Stream the target's RTT output.
     Rtt {
         /// Look for the control block at this exact address instead of
@@ -923,6 +932,7 @@ fn main() -> Result<()> {
         Action::Probe
         | Action::ProbeUnderReset
         | Action::Core(_)
+        | Action::Gdb { .. }
         | Action::Rtt { .. }
         | Action::Flash { .. }
         | Action::Program { .. }
@@ -1057,6 +1067,9 @@ fn main() -> Result<()> {
         }
         Action::Core(action) => {
             run_core(&mut session, &action)?;
+        }
+        Action::Gdb { port, no_halt } => {
+            gdb::serve(&mut session, port, !no_halt, args.url.is_some())?;
         }
         Action::Rtt {
             control_block,
