@@ -653,6 +653,7 @@ dependencies = [
  "rpassword",
  "serialport",
  "sha2 0.10.9",
+ "tracing",
  "tracing-subscriber",
 ]
 

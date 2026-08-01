@@ -15,4 +15,5 @@ probe-rs = "0.31"
 serialport = { version = "4.8", default-features = false }
 rpassword = "7.3"
 sha2 = "0.10"
+tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
