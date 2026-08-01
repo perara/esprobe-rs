@@ -76,12 +76,12 @@ byte-identical, over USB and Wi-Fi alike.
 ## Quick start
 
 ```bash
-cargo install esprobe
+cargo install esprobe --locked
 ```
 
 Wire three pins — SWDIO, SWCLK, ground — with reset optional but worth having.
 Build and flash the firmware from
-[`crates/esprobe-firmware`](crates/esprobe-firmware), then:
+[`crates/esprobe-firmware`](https://github.com/perara/esprobe-rs/tree/master/crates/esprobe-firmware), then:
 
 ```bash
 esprobe identify                       # what is actually on the other end
@@ -156,8 +156,13 @@ one genuinely nasty bug in this project was found.
 ## Using it as a library
 
 The probe-rs backend is the point, so this is a library as well as a binary.
-Anything that wants a probe on the far side of a network can offer the bridge
-alongside probe-rs's own drivers:
+
+```bash
+cargo add esprobe
+```
+
+Anything that wants a probe on the far side of a network can then offer the
+bridge alongside probe-rs's own drivers:
 
 ```rust
 use probe_rs::probe::list::Lister;
@@ -186,9 +191,9 @@ registers first.
 
 | | |
 | --- | --- |
-| [`crates/esprobe`](crates/esprobe) | the CLI and the probe-rs backend |
-| [`crates/esprobe-protocol`](crates/esprobe-protocol) | the wire contract, shared by both halves |
-| [`crates/esprobe-firmware`](crates/esprobe-firmware) | what runs on the ESP32-C3 |
+| [`crates/esprobe`](https://github.com/perara/esprobe-rs/tree/master/crates/esprobe) | the CLI and the probe-rs backend |
+| [`crates/esprobe-protocol`](https://github.com/perara/esprobe-rs/tree/master/crates/esprobe-protocol) | the wire contract, shared by both halves |
+| [`crates/esprobe-firmware`](https://github.com/perara/esprobe-rs/tree/master/crates/esprobe-firmware) | what runs on the ESP32-C3 |
 
 Both ends depend on the same protocol crate, so they cannot drift, and golden
 fixtures pin the actual bytes so they cannot drift in meaning either. The
@@ -198,11 +203,29 @@ directory.
 
 ## Installing
 
+The command-line probe:
+
 ```bash
-cargo install esprobe
+cargo install esprobe --locked
 ```
 
-or from source:
+`--locked` builds against the dependency versions this was tested with; drop
+it if you would rather resolve fresh. Either way you get one binary, `esprobe`,
+in `~/.cargo/bin`.
+
+As a dependency, for your own probe-rs tooling:
+
+```toml
+[dependencies]
+esprobe = "0.1"
+```
+
+| Crate | | |
+| --- | --- | --- |
+| [`esprobe`](https://crates.io/crates/esprobe) | the CLI and probe-rs backend | [docs](https://docs.rs/esprobe) |
+| [`esprobe-protocol`](https://crates.io/crates/esprobe-protocol) | the wire contract, `no_std`, for anything speaking to the bridge | [docs](https://docs.rs/esprobe-protocol) |
+
+Or from source:
 
 ```bash
 git clone https://github.com/perara/esprobe-rs
@@ -210,8 +233,9 @@ cd esprobe-rs
 cargo install --path crates/esprobe     # or: cargo build --release
 ```
 
-Requires Rust 1.88 or newer. The firmware is a separate cross-compiled build;
-see [the firmware README](crates/esprobe-firmware/README.md).
+Requires Rust 1.88 or newer. The firmware is not on crates.io — it is a
+cross-compiled image for one board, not something to fetch as a dependency —
+so build it from [its own directory](https://github.com/perara/esprobe-rs/tree/master/crates/esprobe-firmware).
 
 ## Honest limits
 
