@@ -340,6 +340,69 @@ mod network_transport_tests {
         port
     }
 
+    /// Answers requests in pairs, both replies in one write.
+    ///
+    /// TCP delivers them together, so the read that completes the first reply
+    /// also carries the second — which is what happens on a real bridge as
+    /// soon as a request is kept in flight ahead of the reply being read.
+    fn spawn_batching_bridge() -> u16 {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind a loopback port");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut frame = [0u8; MAX_FRAME + 2];
+            let mut reply = [0u8; MAX_FRAME + 2];
+            let mut len = 0usize;
+            let mut byte = [0u8; 1];
+            let mut batch: Vec<u8> = Vec::new();
+            let mut held = 0usize;
+            while stream.read(&mut byte).unwrap_or(0) == 1 {
+                if byte[0] != 0 {
+                    if len < frame.len() {
+                        frame[len] = byte[0];
+                        len += 1;
+                    }
+                    continue;
+                }
+                if len == 0 {
+                    continue;
+                }
+                if let Ok(request) = decode_request(&mut frame[..len])
+                    && let Ok(n) = encode_response(request.sequence, Status::Ok, &[], &mut reply)
+                {
+                    batch.push(0);
+                    batch.extend_from_slice(&reply[..n]);
+                    held += 1;
+                    if held == 2 {
+                        let _ = stream.write_all(&batch);
+                        batch.clear();
+                        held = 0;
+                    }
+                }
+                len = 0;
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn a_reply_sharing_a_read_with_the_next_is_not_lost() {
+        let port = spawn_batching_bridge();
+        let mut transport =
+            crate::Transport::connect(&format!("127.0.0.1:{port}")).expect("connect to the stub");
+        let first = transport.send(Command::Ping, &[]).expect("send the first");
+        let second = transport.send(Command::Ping, &[]).expect("send the second");
+        transport.receive(first).expect("the first reply");
+        // The bytes of this one arrived in the read that completed the first.
+        // Held in a buffer local to `receive`, they went out of scope with it
+        // and this waited three seconds for a frame already thrown away.
+        transport
+            .receive(second)
+            .expect("the second reply shared a read with the first and was lost");
+    }
+
     #[test]
     fn the_network_transport_completes_a_handshake() {
         let port = spawn_stub_bridge();
