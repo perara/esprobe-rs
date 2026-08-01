@@ -5,6 +5,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
 
 [lib]
 name = "esprobe"
@@ -18,7 +24,7 @@ path = "src/main.rs"
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 ctrlc = "3.4"
-esprobe-protocol = { path = "../esprobe-protocol" }
+esprobe-protocol = { path = "../esprobe-protocol", version = "0.1.0" }
 probe-rs = "0.31"
 serialport = { version = "4.8", default-features = false }
 rpassword = "7.3"
