@@ -62,6 +62,11 @@ mod app {
     const CONTROL_AP_PASSWORD: Option<&str> = option_env!("CONTROL_AP_PASSWORD");
     /// Where runtime credentials live, so a network change costs a command
     /// rather than a rebuild and a reflash.
+    /// Regulatory domain to start from; see `set_regulatory_domain`. Override
+    /// at build time for the bench this probe lives on.
+    const WIFI_COUNTRY: Option<&str> = option_env!("WIFI_COUNTRY");
+    const DEFAULT_WIFI_COUNTRY: &str = "NO";
+
     const NVS_NAMESPACE: &str = "esprobe";
     const NVS_SSID: &str = "sta_ssid";
     const NVS_PASSWORD: &str = "sta_pass";
@@ -1571,10 +1576,37 @@ mod app {
     /// gives a way in, and the board can be given a network later without a
     /// restart.
     fn start_wifi(wifi: &mut BlockingWifi<EspWifi<'static>>) -> Result<()> {
+        set_regulatory_domain();
         let credentials = load_wifi_credentials();
         apply_configuration(wifi, credentials.as_ref())?;
         wifi.start()?;
         Ok(())
+    }
+
+    /// Leaves ESP-IDF's world-safe regulatory mode for a named country.
+    ///
+    /// Without this the radio receives and does not transmit: it scans, reports
+    /// sane signal strengths, reaches `init -> auth` and times out one second
+    /// later with `reason=2`, because the authentication frame it believes it
+    /// sent never reaches the air. Monitoring the target's own channel during a
+    /// join caught 2112 frames from 23 transmitters and not one from this
+    /// radio. Naming a country is what lets it transmit at all.
+    ///
+    /// 802.11d stays enabled, so the country actually used is taken from the
+    /// beacons around it and this is only the starting point.
+    fn set_regulatory_domain() {
+        let country = WIFI_COUNTRY.unwrap_or(DEFAULT_WIFI_COUNTRY);
+        let Ok(code) = std::ffi::CString::new(country) else {
+            warn!("WIFI_COUNTRY {country:?} is not a valid country code");
+            return;
+        };
+        // SAFETY: `code` is a valid NUL-terminated string for the call.
+        let result = unsafe { esp_idf_svc::sys::esp_wifi_set_country_code(code.as_ptr(), true) };
+        if result == esp_idf_svc::sys::ESP_OK {
+            info!("Regulatory domain set to {country}");
+        } else {
+            warn!("Could not set regulatory domain to {country}: {result}");
+        }
     }
 
     /// Programs the radio for one set of station credentials, or for none.
@@ -1609,10 +1641,41 @@ mod app {
         password: &str,
     ) -> Result<bool> {
         let _ = wifi.disconnect();
-        apply_configuration(wifi, Some(&(ssid.to_string(), password.to_string())))?;
         if !wifi.is_started().unwrap_or(false) {
+            apply_configuration(wifi, Some(&(ssid.to_string(), password.to_string())))?;
             wifi.start()?;
         }
+
+        // Pick the access point to associate with, rather than letting the
+        // driver choose. Asking for a complete scan sorted by signal did not
+        // do it: on a mesh publishing one SSID from several nodes, this kept
+        // authenticating against a node at -80 dBm while another answering to
+        // the same name sat at -60. Twenty decibels is the difference between
+        // a link that closes and one that times out, and a timeout at that
+        // stage is indistinguishable from a wrong password.
+        let strongest = wifi
+            .scan()
+            .ok()
+            .and_then(|found| {
+                found
+                    .into_iter()
+                    .filter(|point| point.ssid.as_str() == ssid)
+                    .max_by_key(|point| point.signal_strength)
+            });
+        match &strongest {
+            Some(point) => info!(
+                "Associating with {ssid} at {:02x?} on channel {} ({} dBm)",
+                point.bssid, point.channel, point.signal_strength
+            ),
+            None => warn!("{ssid} did not answer a scan; trying anyway"),
+        }
+        let station = client_configuration(
+            ssid,
+            password,
+            strongest.as_ref().map(|point| point.bssid),
+            strongest.as_ref().map(|point| point.channel),
+        )?;
+        wifi.set_configuration(&Configuration::Client(station))?;
         match wifi.connect().and_then(|()| wifi.wait_netif_up()) {
             Ok(()) => Ok(true),
             Err(error) => {

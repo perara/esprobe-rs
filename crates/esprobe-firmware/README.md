@@ -107,7 +107,23 @@ espflash flash --monitor target/riscv32imc-esp-espidf/release/radio-check
 ```
 
 It logs the negotiated transmit power and what the scan hears every ten
-seconds. If the scan reports access points while `esprobe-radio-check` is
+seconds.
+
+Two things this found, in the order they had to be found:
+
+1. **The radio would not transmit at all** until the regulatory domain was set.
+   ESP-IDF starts in world-safe mode, and in that state this chip received
+   normally — scanning, sane signal strengths — while emitting nothing. It
+   looked exactly like a dead transmitter. `WIFI_COUNTRY` at build time (see
+   `set_regulatory_domain`) is what fixes it, and nothing else can be measured
+   until it is set.
+2. **Radiated power is far below what the chip reports.** With transmission
+   working, the access point arrives at roughly -78 dBm from twenty
+   centimetres away, while access points several metres off arrive at -51 to
+   -61. Free-space loss over twenty centimetres is about 26 dB, so 20 dBm at
+   the pin should arrive near -6. Something in the antenna path is losing
+   around seventy decibels, which is why an access point five metres away
+   never answers an authentication request. If the scan reports access points while `esprobe-radio-check` is
 invisible from a machine in the same room, the radio receives but does not
 transmit, and that is not something firmware can fix. Erasing the flash
 entirely (`espflash erase-flash`) first is worth doing once: it forces a full
