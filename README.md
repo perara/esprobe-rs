@@ -41,13 +41,23 @@ reflash, and no image ever carries a passphrase.
 
 ### Status of the network transport
 
-The Wi-Fi transport is implemented, and its host half is tested against a
-loopback stub bridge — framing over a socket, endpoint parsing, the handshake
-and factory selection. It has **not yet run against a bridge on a real
-network**: on the board it was developed against, the ESP32-C3 receives but
-does not transmit. See `crates/esprobe-firmware/README.md` for how to tell that
-apart from a firmware fault before assuming this code is at fault. Treat the
-end-to-end path as unproven until it has run.
+Working end to end. On an ESP32-C3 SuperMini joined to infrastructure Wi-Fi:
+
+```
+$ esprobe --url 192.168.0.93 identify
+dev_id=0x460 rev_id=0x2001 family=STM32G07x/G08x flash=128 KiB uid=323538353035510e006e0039
+probe_rs_target=STM32G071RBTx
+```
+
+Same target, same UID, as over USB. Two things had to be fixed to get there,
+both in `crates/esprobe-firmware/README.md`: ESP-IDF's world-safe regulatory
+mode stops the radio transmitting at all, and the SuperMini's antenna needs the
+transmit power backed off before an access point will answer it.
+
+Round trips over Wi-Fi run 60–160 ms against a gateway that answers in 0.3 ms,
+which is that board's marginal link retrying, not the bridge. USB stays the
+faster transport by a wide margin; the network one is for a board on a bench
+you are not sitting at.
 
 ## Layout
 
