@@ -50,6 +50,36 @@ fn main() -> anyhow::Result<()> {
             ..Default::default()
         },
     ))?;
+    // The regulatory domain, which gates transmission independently of every
+    // other setting. ESP-IDF starts in world-safe mode ("01"), and a radio in
+    // world-safe mode may be allowed to receive on a channel while being
+    // forbidden to initiate radiation on it — receive without transmit, from
+    // software, with nothing else misconfigured. Naming a country explicitly
+    // is the only way to rule that out.
+    unsafe {
+        let mut country = core::mem::zeroed::<esp_idf_svc::sys::wifi_country_t>();
+        if esp_idf_svc::sys::esp_wifi_get_country(&mut country) == 0 {
+            info!(
+                "regulatory domain before: cc={:?} channels {}..={} policy={}",
+                core::str::from_utf8(&country.cc[..2]),
+                country.schan,
+                country.schan + country.nchan - 1,
+                country.policy,
+            );
+        }
+        let set = esp_idf_svc::sys::esp_wifi_set_country_code(c"NO".as_ptr(), false);
+        info!("esp_wifi_set_country_code(\"NO\") returned {set}");
+        if esp_idf_svc::sys::esp_wifi_get_country(&mut country) == 0 {
+            info!(
+                "regulatory domain after: cc={:?} channels {}..={} policy={}",
+                core::str::from_utf8(&country.cc[..2]),
+                country.schan,
+                country.schan + country.nchan - 1,
+                country.policy,
+            );
+        }
+    }
+
     wifi.start()?;
     info!("Access point 'esprobe-radio-check' started on channel 1");
 
