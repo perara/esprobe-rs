@@ -83,8 +83,9 @@ enum WifiAction {
     Set {
         #[arg(long)]
         ssid: String,
-        /// Omit for an open network; you will be prompted rather than passing
-        /// it on a command line that the shell will remember.
+        /// Omit to be prompted, rather than passing the passphrase on a
+        /// command line that the shell will remember. For an open network,
+        /// omit it and submit the prompt empty.
         #[arg(long)]
         password: Option<String>,
     },
@@ -302,6 +303,13 @@ fn main() -> Result<()> {
     if args.no_blocks {
         serial.block_words = 1;
     }
+    // Before any SWD configuration is pushed to the bridge. Provisioning the
+    // radio has nothing to do with the wire, and `set_pin_map` below would
+    // quietly revert a bridge built with its pins swapped — the same class of
+    // mistake `pin-map` exists to catch.
+    if let Action::Wifi(action) = &args.command {
+        return run_wifi(&mut serial, action);
+    }
     serial.set_engine(args.engine)?;
     serial.set_pin_map(args.swap_swd)?;
     serial.set_speed(args.speed_khz)?;
@@ -477,42 +485,7 @@ fn main() -> Result<()> {
             serial.detach()?;
             return Ok(());
         }
-        Action::Wifi(action) => {
-            match action {
-                WifiAction::Status => {
-                    let reply = serial.command(Command::WifiStatus, &[])?;
-                    let [connected, a, b, c, d, ssid_len, ssid @ ..] = reply.as_slice() else {
-                        bail!("invalid wifi-status response");
-                    };
-                    let ssid = std::str::from_utf8(&ssid[..usize::from(*ssid_len).min(ssid.len())])
-                        .unwrap_or("<invalid utf-8>");
-                    if *connected != 0 {
-                        println!("connected ssid={ssid} ip={a}.{b}.{c}.{d}");
-                    } else if ssid.is_empty() {
-                        println!("no network configured");
-                    } else {
-                        println!("configured ssid={ssid} but not connected");
-                    }
-                }
-                WifiAction::Set { ssid, password } => {
-                    let password = match password {
-                        Some(password) => password.clone(),
-                        None => rpassword::prompt_password("Wi-Fi password (empty for open): ")
-                            .context("failed to read the password")?,
-                    };
-                    let mut payload = vec![0u8; 2 + ssid.len() + password.len()];
-                    let length = esprobe_protocol::wifi::encode(ssid, &password, &mut payload)
-                        .context("SSID or password is too long")?;
-                    serial.command(Command::WifiSet, &payload[..length])?;
-                    println!("stored ssid={ssid}; the bridge will join within a few seconds");
-                }
-                WifiAction::Forget => {
-                    serial.command(Command::WifiForget, &[])?;
-                    println!("forgotten");
-                }
-            }
-            return Ok(());
-        }
+        Action::Wifi(_) => unreachable!("wifi runs before any SWD configuration"),
         Action::PinMap => {
             let map = serial.command(Command::PinMap, &[])?;
             let [swdio, swclk, reset, s0, s1, tx, rx] = map.as_slice() else {
@@ -1337,6 +1310,44 @@ fn wait_or_stop(duration: Duration, stop: &AtomicBool) {
     }
 }
 
+/// Reads or changes the network the bridge joins.
+fn run_wifi(serial: &mut SerialDapProbe, action: &WifiAction) -> Result<()> {
+    match action {
+        WifiAction::Status => {
+            let reply = serial.command(Command::WifiStatus, &[])?;
+            let [connected, a, b, c, d, ssid_len, ssid @ ..] = reply.as_slice() else {
+                bail!("invalid wifi-status response");
+            };
+            let ssid = std::str::from_utf8(&ssid[..usize::from(*ssid_len).min(ssid.len())])
+                .unwrap_or("<invalid utf-8>");
+            if *connected != 0 {
+                println!("connected ssid={ssid} ip={a}.{b}.{c}.{d}");
+            } else if ssid.is_empty() {
+                println!("no network configured");
+            } else {
+                println!("configured ssid={ssid} but not connected");
+            }
+        }
+        WifiAction::Set { ssid, password } => {
+            let password = match password {
+                Some(password) => password.clone(),
+                None => rpassword::prompt_password("Wi-Fi password (empty for open): ")
+                    .context("failed to read the password")?,
+            };
+            let mut payload = vec![0u8; 2 + ssid.len() + password.len()];
+            let length = esprobe_protocol::wifi::encode(ssid, &password, &mut payload)
+                .context("SSID or password is too long")?;
+            serial.command(Command::WifiSet, &payload[..length])?;
+            println!("stored ssid={ssid}; the bridge will join within a few seconds");
+        }
+        WifiAction::Forget => {
+            serial.command(Command::WifiForget, &[])?;
+            println!("forgotten");
+        }
+    }
+    Ok(())
+}
+
 /// Either link the bridge protocol runs over.
 ///
 /// The frames, the sequencing and every command are the same; only the bytes'
@@ -1422,6 +1433,11 @@ impl Transport {
         let mut chunk = [0u8; MAX_FRAME + 2];
         while Instant::now() < deadline {
             let read = match self.port.read(&mut chunk) {
+                // Zero bytes from a socket is the peer having closed it, which
+                // no amount of waiting undoes. Falling through to the loop
+                // spun a core flat until the deadline, once per command, for
+                // as long as the caller kept trying.
+                Ok(0) => bail!("the bridge closed the connection"),
                 Ok(read) => read,
                 // A serial port reports a lapsed read timeout as `TimedOut`; a
                 // socket reports it as `WouldBlock`. Only the first was

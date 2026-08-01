@@ -62,10 +62,15 @@ mod app {
     const CONTROL_AP_PASSWORD: Option<&str> = option_env!("CONTROL_AP_PASSWORD");
     /// Where runtime credentials live, so a network change costs a command
     /// rather than a rebuild and a reflash.
-    /// Regulatory domain to start from; see `set_regulatory_domain`. Override
-    /// at build time for the bench this probe lives on.
+    /// Regulatory domain to start from; see `set_regulatory_domain`.
+    ///
+    /// `scripts/build.sh` requires this, so a normal build always names one.
+    /// The fallback is ESP-IDF's own world-safe domain rather than any real
+    /// country: transmitting under someone else's regulator is worse than not
+    /// transmitting, and picking a default here would do exactly that for
+    /// everyone who is not where this was written.
     const WIFI_COUNTRY: Option<&str> = option_env!("WIFI_COUNTRY");
-    const DEFAULT_WIFI_COUNTRY: &str = "NO";
+    const DEFAULT_WIFI_COUNTRY: &str = "01";
 
     const NVS_NAMESPACE: &str = "esprobe";
     /// The transmit power that last associated successfully.
@@ -882,7 +887,7 @@ mod app {
                 }
                 BridgeCommand::WifiForget => {
                     forget_wifi_credentials().map_err(|_| SwdError::Protocol(2))?;
-                    let mut wifi = self.wifi.lock().map_err(|_| SwdError::Protocol(0))?;
+                    let mut wifi = self.wifi.lock().map_err(|_| SwdError::Protocol(3))?;
                     wifi.pending = None;
                     wifi.forget = true;
                     wifi.ssid = String::new();
@@ -1361,18 +1366,28 @@ mod app {
                 info!("Joining Wi-Fi {ssid} on request");
                 attempt = 0;
                 match join_wifi(&mut wifi, &ssid, &password, attempt) {
+                    // Left at zero on success, so the next reconnect starts
+                    // from the power just stored rather than one rung down it.
                     Ok(true) => info!("Joined {ssid}"),
-                    Ok(false) => warn!("Could not join {ssid}"),
-                    Err(error) => warn!("Joining {ssid} failed: {error}"),
+                    Ok(false) => {
+                        warn!("Could not join {ssid}");
+                        attempt += 1;
+                    }
+                    Err(error) => {
+                        warn!("Joining {ssid} failed: {error}");
+                        attempt += 1;
+                    }
                 }
-                attempt += 1;
                 credentials = Some((ssid, password));
             } else if !wifi.is_connected().unwrap_or(false)
                 && let Some((ssid, password)) = credentials.as_ref()
             {
-                // Each retry moves down the ladder; a success stops it moving.
+                // Each retry moves down the ladder; a success rewinds it, so a
+                // link that drops later retries at the power that worked
+                // instead of resuming mid-ladder at one that did not.
                 if join_wifi(&mut wifi, ssid, password, attempt).unwrap_or(false) {
                     info!("Joined {ssid}");
+                    attempt = 0;
                 } else {
                     attempt += 1;
                 }
@@ -1622,6 +1637,14 @@ mod app {
     /// beacons around it and this is only the starting point.
     fn set_regulatory_domain() {
         let country = WIFI_COUNTRY.unwrap_or(DEFAULT_WIFI_COUNTRY);
+        if WIFI_COUNTRY.is_none() {
+            warn!(
+                "WIFI_COUNTRY was not set, so the radio starts in world-safe mode \
+                 ({DEFAULT_WIFI_COUNTRY}). In that mode this chip receives and does not \
+                 transmit: scans work, association times out with reason=2. Build with \
+                 WIFI_COUNTRY set to your own regulatory domain."
+            );
+        }
         let Ok(code) = std::ffi::CString::new(country) else {
             warn!("WIFI_COUNTRY {country:?} is not a valid country code");
             return;
@@ -1670,14 +1693,28 @@ mod app {
     /// assuming.
     const TX_POWER_LADDER: [i8; 5] = [80, 60, 52, 40, 32];
 
+    /// Quarter-dBm bounds `esp_wifi_set_max_tx_power` accepts.
+    const MIN_TX_POWER: i8 = 8;
+    const MAX_TX_POWER: i8 = 84;
+
     /// The transmit power that last worked, so a probe does not re-derive it.
+    ///
+    /// Range-checked on the way out: a stale byte left in this namespace by
+    /// another build casts to anything at all, and an out-of-range request is
+    /// rejected by the driver, quietly wasting the one attempt that was
+    /// supposed to be the fast path.
     fn load_tx_power() -> Option<i8> {
-        credential_store()
+        let stored = credential_store()
             .ok()?
             .get_u8(NVS_TX_POWER)
             .ok()
-            .flatten()
-            .map(|stored| stored as i8)
+            .flatten()? as i8;
+        if (MIN_TX_POWER..=MAX_TX_POWER).contains(&stored) {
+            Some(stored)
+        } else {
+            warn!("Ignoring stored transmit power {stored}, which is out of range");
+            None
+        }
     }
 
     fn store_tx_power(power: i8) {
@@ -1708,8 +1745,13 @@ mod app {
         attempt: usize,
     ) -> Result<bool> {
         let _ = wifi.disconnect();
+        // Station mode first, and unconditionally. An access-point-only radio
+        // cannot scan — `esp_wifi_scan_start` returns ESP_FAIL — so a probe
+        // that came up unprovisioned would skip the scan below and associate
+        // without pinning a BSSID, on exactly the first join where the user
+        // has no other way in.
+        apply_configuration(wifi, Some(&(ssid.to_string(), password.to_string())))?;
         if !wifi.is_started().unwrap_or(false) {
-            apply_configuration(wifi, Some(&(ssid.to_string(), password.to_string())))?;
             wifi.start()?;
         }
 
@@ -1720,15 +1762,12 @@ mod app {
         // the same name sat at -60. Twenty decibels is the difference between
         // a link that closes and one that times out, and a timeout at that
         // stage is indistinguishable from a wrong password.
-        let strongest = wifi
-            .scan()
-            .ok()
-            .and_then(|found| {
-                found
-                    .into_iter()
-                    .filter(|point| point.ssid.as_str() == ssid)
-                    .max_by_key(|point| point.signal_strength)
-            });
+        let strongest = wifi.scan().ok().and_then(|found| {
+            found
+                .into_iter()
+                .filter(|point| point.ssid.as_str() == ssid)
+                .max_by_key(|point| point.signal_strength)
+        });
         match &strongest {
             Some(point) => info!(
                 "Associating with {ssid} at {:02x?} on channel {} ({} dBm)",
@@ -1746,7 +1785,10 @@ mod app {
 
         let tx_power = tx_power_for(attempt, load_tx_power());
         // SAFETY: the radio is started and this only sets a driver limit.
-        unsafe { esp_idf_svc::sys::esp_wifi_set_max_tx_power(tx_power) };
+        let set = unsafe { esp_idf_svc::sys::esp_wifi_set_max_tx_power(tx_power) };
+        if set != esp_idf_svc::sys::ESP_OK {
+            warn!("Could not set transmit power to {tx_power} quarter-dBm: {set}");
+        }
         info!(
             "Attempt {attempt} at {}.{} dBm",
             tx_power / 4,

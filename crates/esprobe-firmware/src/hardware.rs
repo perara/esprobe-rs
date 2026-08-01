@@ -187,10 +187,6 @@ impl<'d> EspSwdIo<'d> {
         self.engine = engine;
     }
 
-    pub fn engine(&self) -> Engine {
-        self.engine
-    }
-
     /// Drives a pattern and samples the pad simultaneously, so what GPSPI2
     /// emits can be compared against what it was asked to emit.
     pub fn spi_loopback(&mut self, bits: u64, count: u8) -> u64 {
@@ -242,15 +238,6 @@ impl<'d> EspSwdIo<'d> {
     fn drive_channels(levels: u32) {
         // SAFETY: 0x805 is CSR_GPIO_OUT_USER on ESP32-C3.
         unsafe { core::arch::asm!("csrw 0x805, {levels}", levels = in(reg) levels) };
-    }
-
-    #[inline(always)]
-    fn bit_bang_clock(&mut self) {
-        let half = self.half_cycle_cycles;
-        Self::drive_channels(0);
-        self.delay_cycles(half);
-        Self::drive_channels(SWCLK_CHANNEL);
-        self.delay_cycles(half);
     }
 
     /// Times the bit-bang loop against the cycle counter with both pads
