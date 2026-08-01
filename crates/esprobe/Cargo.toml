@@ -17,3 +17,5 @@ rpassword = "7.3"
 sha2 = "0.10"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+gdbstub = "0.7"
+gdbstub_arch = "0.3"

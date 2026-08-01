@@ -113,6 +113,58 @@ an `address:port`, or a dotted name is a network bridge, and anything else is
 opened as a serial device. A single-label host is not guessed at, since
 nothing distinguishes `probe` from a device name — write `probe:3333`.
 
+## Debugging
+
+A probe you can only flash is not a debug probe. Everything below is
+probe-rs's `Core` reached through the bridge, and works over USB or Wi-Fi.
+
+```bash
+esprobe core status                  # running, halted, sleeping, and why
+esprobe core halt / run / step --count 5
+esprobe core reset-halt              # catch it before the first instruction
+esprobe core registers               # the whole file
+esprobe core read  0x08000000 --words 4
+esprobe core write 0x20000000 0xcafebabe 0xdeadbeef
+esprobe core run-to 0x08000123       # breakpoint, resume, wait, release
+```
+
+`run-to` exists because `break-set` followed by `run` cannot work: each
+invocation attaches and detaches, so a breakpoint set by one command is gone
+before the next runs. `run-to` does all of it in one session.
+
+### GDB
+
+```bash
+esprobe gdb --port 1234              # then, in gdb:  target remote :1234
+```
+
+A real GDB server, so `gdb`, VS Code's `cortex-debug` or CLion drive the target
+through the bridge: registers, memory, Thumb disassembly, single-stepping, and
+hardware breakpoints that GDB sets and clears itself. Software breakpoints are
+served from hardware units too, because a Cortex-M's code lives in flash and
+GDB's default trap-instruction write would go nowhere.
+
+Over Wi-Fi, run `set remotetimeout 30` first. Reading the register file is
+seventeen round trips, which takes several seconds across a network link and
+overruns GDB's two-second default; the server says so when it starts.
+
+### RTT
+
+```bash
+esprobe rtt                          # scan RAM for the control block
+esprobe rtt --control-block 0x20000000 --idle-ms 500
+```
+
+Streams the target's RTT channels, found by scanning RAM or from an address you
+give it.
+
+### Seeing what the bridge is doing
+
+`--verbose` traces probe-rs and this bridge together;
+`RUST_LOG=esprobe=trace` adds every protocol frame with its sequence, command,
+size and round-trip time, which is what separates a wire fault from a
+transport one.
+
 ### Identify, don't assume
 
 `probe-rs attach` succeeds against whatever target name you hand it — the same
