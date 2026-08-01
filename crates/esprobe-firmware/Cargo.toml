@@ -2,7 +2,10 @@
 name = "esprobe-firmware"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
+description = "ESP32-C3 firmware serving the esprobe SWD bridge over USB and Wi-Fi"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/perara/esprobe-rs"
 publish = false
 
 [lib]

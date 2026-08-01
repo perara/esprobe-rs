@@ -1507,7 +1507,18 @@ impl SerialDapProbe {
 
     fn with_transport(transport: Transport) -> Result<Self> {
         let mut transport = transport;
-        let hello = transport.command(Command::Hello, &[])?;
+        // A frame carrying a different protocol version is rejected outright
+        // by the far end, which then says nothing at all — so the first
+        // command timing out is what a version mismatch looks like, and it is
+        // otherwise indistinguishable from a dead board or the wrong port.
+        let version = esprobe_protocol::frame::VERSION;
+        let hello = transport.command(Command::Hello, &[]).with_context(|| {
+            format!(
+                "the bridge did not answer; if it is powered and this is the \
+                 right port, its firmware probably predates protocol version \
+                 {version} — rebuild and reflash it"
+            )
+        })?;
         if hello != b"DAP1" {
             bail!("unexpected bridge identity");
         }

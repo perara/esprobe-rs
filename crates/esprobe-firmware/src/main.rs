@@ -1341,6 +1341,7 @@ mod app {
         // pointless work and two lines of log noise per second.
         let mut credentials = load_wifi_credentials();
         let mut attempt = 0usize;
+        let mut fallback_passes = 0usize;
 
         loop {
             thread::sleep(Duration::from_secs(2));
@@ -1365,6 +1366,7 @@ mod app {
             if let Some((ssid, password)) = pending {
                 info!("Joining Wi-Fi {ssid} on request");
                 attempt = 0;
+                fallback_passes = 0;
                 match join_wifi(&mut wifi, &ssid, &password, attempt) {
                     // Left at zero on success, so the next reconnect starts
                     // from the power just stored rather than one rung down it.
@@ -1379,7 +1381,13 @@ mod app {
                     }
                 }
                 credentials = Some((ssid, password));
-            } else if !wifi.is_connected().unwrap_or(false)
+            } else if fallback_passes > 0 {
+                // Holding the access point open. Nothing to do but count down.
+                fallback_passes -= 1;
+                if fallback_passes == 0 {
+                    info!("Access point window over; trying the stored network again");
+                }
+            } else if !station_online(&wifi)
                 && let Some((ssid, password)) = credentials.as_ref()
             {
                 // Each retry moves down the ladder; a success rewinds it, so a
@@ -1390,6 +1398,22 @@ mod app {
                     attempt = 0;
                 } else {
                     attempt += 1;
+                    // A whole ladder with nothing to show for it. Joining puts
+                    // the radio in station mode, so retrying forever means a
+                    // probe given a wrong passphrase, or carried out of range,
+                    // has no way in but the cable the access point exists to
+                    // avoid needing. Give it back for a while, then try again.
+                    if attempt.is_multiple_of(TX_POWER_LADDER.len()) {
+                        warn!(
+                            "{ssid} did not answer at any transmit power; \
+                             publishing the access point for {AP_FALLBACK_PASSES} passes"
+                        );
+                        if let Err(error) = apply_configuration(&mut wifi, None) {
+                            warn!("Could not publish the access point: {error}");
+                        } else {
+                            fallback_passes = AP_FALLBACK_PASSES;
+                        }
+                    }
                 }
             }
 
@@ -1399,12 +1423,7 @@ mod app {
                 // which reported a connection with no network and no address.
                 // An address on the board interface is the thing the host
                 // actually cares about.
-                control.connected = wifi.is_connected().unwrap_or(false)
-                    && wifi
-                        .wifi()
-                        .sta_netif()
-                        .get_ip_info()
-                        .is_ok_and(|info| !info.ip.is_unspecified());
+                control.connected = station_online(&wifi);
                 control.ip = wifi
                     .wifi()
                     .sta_netif()
@@ -1593,6 +1612,23 @@ mod app {
             }
             bytes = &bytes[written as usize..];
         }
+    }
+
+    /// Loop passes to hold the access point open after a failed ladder, at two
+    /// seconds a pass.
+    const AP_FALLBACK_PASSES: usize = 15;
+
+    /// Whether the board half actually has a network.
+    ///
+    /// `is_connected` is also true for a running access point, so on its own it
+    /// reports a probe publishing its own SSID as connected to something.
+    fn station_online(wifi: &BlockingWifi<EspWifi<'static>>) -> bool {
+        wifi.is_connected().unwrap_or(false)
+            && wifi
+                .wifi()
+                .sta_netif()
+                .get_ip_info()
+                .is_ok_and(|info| !info.ip.is_unspecified())
     }
 
     /// Brings the radio up with whatever configuration is available.

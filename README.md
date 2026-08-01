@@ -33,7 +33,7 @@ working:
 ```bash
 esprobe wifi set --ssid my-network   # prompts for the passphrase
 esprobe wifi status
-esprobe wifi forget                  # falls back to the probe's own access point
+esprobe wifi forget                  # back to the probe's own access point
 ```
 
 Credentials live in NVS on the device, so they survive a power cycle and a
