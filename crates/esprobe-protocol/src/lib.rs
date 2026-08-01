@@ -9,4 +9,5 @@
 
 pub mod clock;
 pub mod frame;
+pub mod json;
 pub mod wifi;

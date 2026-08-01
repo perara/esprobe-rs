@@ -23,7 +23,14 @@ Verified against an STM32G071 and an STM32F407 over USB:
 | --- | ---: |
 | Identify, attach, connect-under-reset | works |
 | Program, with backup and read-back verification | works |
-| Bulk read | 453 KiB/s |
+| Bulk read, 8 MHz default wire clock | 333 KiB/s |
+| Bulk read, `--speed-khz 16000` | 456 KiB/s |
+
+The wire is the limit, not the transport: raising `--depth` moves the bulk
+figure by about one percent, and raising the clock moves it proportionally.
+8 MHz is the default because it is what a mux path and unshielded bench leads
+carry reliably; direct-wired to a devkit, 16 MHz is fine. Both dumps above are
+byte-identical.
 
 ### Provisioning
 
