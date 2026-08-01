@@ -480,10 +480,22 @@ impl<'session> BlockingEventLoop for ProbeEventLoop<'session> {
 
 /// Serves GDB sessions on `port` until interrupted.
 ///
-/// Successive sessions rather than one: a debugger that disconnects, or a
-/// session lost to a wire fault, would otherwise mean restarting the server
-/// and re-attaching the probe.
-pub fn serve(session: &mut Session, port: u16, halt_first: bool, slow_link: bool) -> Result<()> {
+/// Takes a way to build a session rather than a session, so one can be built
+/// again. A protocol error on the wire — an SWD ACK of 0b111, which halting
+/// and restarting a core rapidly provokes — leaves probe-rs's view of the
+/// debug port out of step with the target, and nothing short of attaching
+/// again puts it right: probe-rs owns the SELECT and CSW state over raw DAP
+/// access, so the firmware cannot quietly reset the line underneath it
+/// without invalidating what the host believes. Rebuilding the session is the
+/// recovery, and doing it here means the debugger reconnects instead of the
+/// operator restarting the probe.
+pub fn serve(
+    session: Session,
+    mut make_session: impl FnMut() -> Result<Session>,
+    port: u16,
+    halt_first: bool,
+    slow_link: bool,
+) -> Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", port))
         .with_context(|| format!("failed to listen on port {port}"))?;
     eprintln!("gdb server on tcp/{port}; connect with: target remote :{port}");
@@ -496,12 +508,24 @@ pub fn serve(session: &mut Session, port: u16, halt_first: bool, slow_link: bool
         eprintln!("this bridge is on the network: run `set remotetimeout 30` before connecting");
     }
 
+    let mut session = session;
     loop {
         let (stream, peer) = listener.accept().context("failed to accept a debugger")?;
         stream.set_nodelay(true)?;
         eprintln!("debugger attached from {peer}");
-        if let Err(error) = serve_one(session, stream, halt_first) {
+        if let Err(error) = serve_one(&mut session, stream, halt_first) {
             eprintln!("session ended with an error: {error:#}");
+            // The link, not just the session, is suspect after this. The old
+            // one is dropped first: it holds the port the new one needs.
+            eprintln!("re-attaching to the target");
+            drop(session);
+            session = match make_session() {
+                Ok(fresh) => fresh,
+                Err(error) => {
+                    eprintln!("could not re-attach: {error:#}");
+                    return Err(error);
+                }
+            };
         }
         eprintln!("waiting for the next debugger on tcp/{port}");
     }

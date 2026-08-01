@@ -972,7 +972,7 @@ fn main() -> Result<()> {
     drop(serial);
     let lister = Lister::with_lister(Box::new(esprobe::factory::EspBridgeLister::new()));
     let mut probe = lister
-        .open(selector)
+        .open(selector.clone())
         .with_context(|| format!("failed to open the bridge at {link_selector}"))?;
     probe.select_protocol(WireProtocol::Swd)?;
     // probe-rs's own connect-under-reset, driven through the standard
@@ -1041,7 +1041,30 @@ fn main() -> Result<()> {
             run_core(&mut session, &action)?;
         }
         Action::Gdb { port, no_halt } => {
-            gdb::serve(&mut session, port, !no_halt, args.url.is_some())?;
+            // A closure rather than the session itself: a wire fault needs
+            // the whole attach redone, and only here is what it takes to do
+            // that still in scope.
+            let attach_target = target.clone();
+            let attach_selector = selector;
+            let attach_under_reset = under_reset;
+            gdb::serve(
+                session,
+                move || {
+                    let lister =
+                        Lister::with_lister(Box::new(esprobe::factory::EspBridgeLister::new()));
+                    let mut probe = lister.open(attach_selector.clone())?;
+                    probe.select_protocol(WireProtocol::Swd)?;
+                    let session = if attach_under_reset {
+                        probe.attach_under_reset(attach_target.as_str(), Permissions::default())
+                    } else {
+                        probe.attach(attach_target.as_str(), Permissions::default())
+                    }?;
+                    Ok(session)
+                },
+                port,
+                !no_halt,
+                args.url.is_some(),
+            )?;
         }
         Action::Rtt {
             control_block,
