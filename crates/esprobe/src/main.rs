@@ -180,7 +180,17 @@ enum Action {
     /// Ask the running STM32 Rust firmware to jump to its ROM UART bootloader.
     EnterRomBoot,
     /// Passively capture bytes from the STM32 display UART.
-    UartReceive,
+    UartReceive {
+        /// How long to listen, in milliseconds. The bridge clears the receive
+        /// buffer first, so this is the whole capture window.
+        #[arg(long, default_value_t = 100)]
+        ms: u16,
+    },
+    /// Send bytes to the STM32 display UART and print whatever it answers.
+    UartSend {
+        /// The bytes to send, as hex. Whitespace and a leading `0x` are ignored.
+        hex: String,
+    },
     /// Reset the STM32 and atomically capture its startup UART bytes.
     UartResetCapture {
         /// Passively listen on GPIO5 instead of the schematic-normal GPIO6.
@@ -526,8 +536,19 @@ fn main() -> Result<()> {
             println!();
             return Ok(());
         }
-        Action::UartReceive => {
-            let response = serial.command(Command::UartReceive, &[])?;
+        Action::UartSend { hex } => {
+            let payload = parse_hex(hex)?;
+            let response = serial.command(Command::UartSend, &payload)?;
+            print!("stm32_uart_rx=");
+            for byte in response {
+                print!("{byte:02x}");
+            }
+            println!();
+            return Ok(());
+        }
+        Action::UartReceive { ms } => {
+            let payload = ms.to_le_bytes();
+            let response = serial.command(Command::UartReceive, &payload)?;
             print!("stm32_uart_rx=");
             for byte in response {
                 print!("{byte:02x}");
@@ -987,8 +1008,11 @@ fn main() -> Result<()> {
 
     match args.command {
         Action::Lines => unreachable!("line-state command returned before probe attachment"),
-        Action::UartReceive => {
+        Action::UartReceive { .. } => {
             unreachable!("UART receive command returned before probe attachment")
+        }
+        Action::UartSend { .. } => {
+            unreachable!("UART send command returned before probe attachment")
         }
         Action::UartResetCapture { .. } => {
             unreachable!("UART reset-capture command returned before probe attachment")
@@ -1461,4 +1485,24 @@ fn run_wifi(serial: &mut SerialDapProbe, action: &WifiAction) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Parses a hex byte string, tolerating whitespace, `0x`, and `:` separators.
+fn parse_hex(text: &str) -> anyhow::Result<Vec<u8>> {
+    let cleaned: String = text
+        .trim()
+        .trim_start_matches("0x")
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != ':' && *c != '_')
+        .collect();
+    if cleaned.len() % 2 != 0 {
+        anyhow::bail!("a hex payload needs an even number of digits, got {}", cleaned.len());
+    }
+    (0..cleaned.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&cleaned[i..i + 2], 16)
+                .with_context(|| format!("`{}` is not a hex byte", &cleaned[i..i + 2]))
+        })
+        .collect()
 }

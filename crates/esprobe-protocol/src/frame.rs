@@ -1,6 +1,6 @@
 //! Framing contract for the USB-serial ARM DAP bridge.
 
-pub const VERSION: u8 = 4;
+pub const VERSION: u8 = 5;
 /// Large enough for a 256-word block read plus the envelope and worst-case
 /// COBS overhead. One USB round trip per kibibyte, rather than per word, is
 /// what keeps the wire — not the transport — the limiting factor.
@@ -53,6 +53,7 @@ pub enum Command {
     WifiStatus = 0x2e,
     WifiSet = 0x2f,
     WifiForget = 0x30,
+    UartSend = 0x31,
 }
 
 impl TryFrom<u8> for Command {
@@ -76,6 +77,7 @@ impl TryFrom<u8> for Command {
             0x1a => Ok(Self::DiagnosticSwdio),
             0x1b => Ok(Self::EnterRomBoot),
             0x1c => Ok(Self::UartReceive),
+            0x31 => Ok(Self::UartSend),
             0x1d => Ok(Self::UartResetCapture),
             0x1e => Ok(Self::MuxProbe),
             0x1f => Ok(Self::ReadRegisterBlock),
@@ -325,7 +327,7 @@ mod tests {
         let length = encode_request(0x1234, Command::Hello, &[], &mut frame).unwrap();
         assert_eq!(
             &frame[..length],
-            &[11, b'E', b'S', b'P', b'B', 4, 0x34, 0x12, 1, 0x9e, 0x3e, 0],
+            &[11, b'E', b'S', b'P', b'B', 5, 0x34, 0x12, 1, 0x2a, 0x48, 0],
             "the Hello request encoding moved"
         );
 
@@ -335,7 +337,7 @@ mod tests {
         assert_eq!(
             &frame[..length],
             &[
-                8, b'E', b'S', b'P', b'R', 4, 0x34, 0x12, 5, 0xde, 0xad, 0xc9, 0x16, 0
+                8, b'E', b'S', b'P', b'R', 5, 0x34, 0x12, 5, 0xde, 0xad, 0x69, 0x53, 0
             ],
             "the response encoding moved"
         );
@@ -346,7 +348,8 @@ mod tests {
         assert_eq!(Command::ReadRegister as u8, 0x10);
         assert_eq!(Command::MemoryRead as u8, 0x29);
         assert_eq!(Status::TargetInReset as u8, 8);
-        assert_eq!(VERSION, 4);
+        assert_eq!(Command::UartSend as u8, 0x31);
+        assert_eq!(VERSION, 5);
     }
 
     #[test]
@@ -376,6 +379,7 @@ mod tests {
         assert_eq!(Command::try_from(0x1a), Ok(Command::DiagnosticSwdio));
         assert_eq!(Command::try_from(0x1b), Ok(Command::EnterRomBoot));
         assert_eq!(Command::try_from(0x1c), Ok(Command::UartReceive));
+        assert_eq!(Command::try_from(0x31), Ok(Command::UartSend));
         assert_eq!(Command::try_from(0x1d), Ok(Command::UartResetCapture));
         assert_eq!(Command::try_from(0x1e), Ok(Command::MuxProbe));
         assert_eq!(Command::try_from(0x1f), Ok(Command::ReadRegisterBlock));

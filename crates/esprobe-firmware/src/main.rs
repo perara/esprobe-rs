@@ -28,6 +28,7 @@ mod app {
     use esp_idf_svc::hal::delay::Ets;
     use esp_idf_svc::hal::gpio::{AnyIOPin, InputOutput, PinDriver, Pull};
     use esp_idf_svc::hal::peripherals::Peripherals;
+    use esp_idf_svc::hal::delay::TickType;
     use esp_idf_svc::hal::uart::{
         UartDriver,
         config::{Config as UartConfig, Parity},
@@ -563,22 +564,74 @@ mod app {
                     parity_restore?;
                     Ok(length)
                 }
-                BridgeCommand::UartReceive => {
-                    if !payload.is_empty() {
-                        return Err(SwdError::Protocol(0));
-                    }
+                BridgeCommand::UartSend => {
+                    // Write to the STM32's control UART and capture whatever it
+                    // answers, in one round trip. The plane is request/response,
+                    // so a separate receive would race the reply.
                     self.display
                         .change_parity(Parity::ParityNone)
                         .map_err(|_| SwdError::Protocol(0))?;
                     self.display.clear_rx().map_err(|_| SwdError::Protocol(0))?;
+                    Self::set_gpio_direction(pinmap::DISP_TX, gpio_mode_t_GPIO_MODE_OUTPUT)
+                        .map_err(|_| SwdError::Protocol(0))?;
+                    let written = self.display.write(payload);
+                    let drained = self.display.wait_tx_done(200);
+                    // Release the line whatever happened above: leaving the
+                    // bridge driving DISP_TX would fight the STM32's own
+                    // transmitter, which is the contention this pin map exists
+                    // to avoid.
                     Self::set_gpio_direction(pinmap::DISP_TX, gpio_mode_t_GPIO_MODE_INPUT)
                         .map_err(|_| SwdError::Protocol(0))?;
+                    written.map_err(|_| SwdError::Protocol(0))?;
+                    drained.map_err(|_| SwdError::Protocol(0))?;
                     // Ten bytes are reserved by the bridge envelope.
                     let capacity = response.len().min(BRIDGE_MAX_FRAME - 10);
                     Ok(self
                         .display
-                        .read(&mut response[..capacity], 100)
+                        .read(&mut response[..capacity], 200)
                         .unwrap_or(0))
+                }
+                BridgeCommand::UartReceive => {
+                    // An optional little-endian u16 of milliseconds to listen
+                    // for. The bridge is a passive tap on the STM32's transmit
+                    // line, so the window is the whole measurement.
+                    let window_ms: u32 = match payload {
+                        [] => 1000,
+                        [low, high] => u32::from(u16::from_le_bytes([*low, *high])),
+                        _ => return Err(SwdError::Protocol(0)),
+                    };
+                    // The host abandons a command after three seconds.
+                    let window_ms = window_ms.min(2_000);
+                    self.display
+                        .change_parity(Parity::ParityNone)
+                        .map_err(|_| SwdError::Protocol(0))?;
+                    // Deliberately no `clear_rx`: the driver's buffer is the
+                    // only thing holding traffic that arrived between calls,
+                    // and discarding it made a passive tap miss everything it
+                    // was not lucky enough to be inside the window for.
+                    Self::set_gpio_direction(pinmap::DISP_TX, gpio_mode_t_GPIO_MODE_INPUT)
+                        .map_err(|_| SwdError::Protocol(0))?;
+                    // Ten bytes are reserved by the bridge envelope.
+                    let capacity = response.len().min(BRIDGE_MAX_FRAME - 10);
+                    // `read` returns as soon as it has any byte at all, so a
+                    // single call stops partway through a frame. Keep going
+                    // until the buffer fills or the window closes.
+                    let deadline =
+                        std::time::Instant::now() + Duration::from_millis(u64::from(window_ms));
+                    let mut filled = 0usize;
+                    while filled < capacity {
+                        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                        if remaining.is_zero() {
+                            break;
+                        }
+                        // This argument is FreeRTOS ticks, not milliseconds.
+                        let ticks = TickType::from(remaining).ticks() as u32;
+                        match self.display.read(&mut response[filled..capacity], ticks.max(1)) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => filled += n,
+                        }
+                    }
+                    Ok(filled)
                 }
                 BridgeCommand::UartResetCapture => {
                     let swapped = match payload {
