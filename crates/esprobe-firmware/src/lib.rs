@@ -6,6 +6,113 @@ pub mod safety;
 pub use esprobe_protocol::wifi as wifi_credentials;
 pub mod actuator;
 pub mod stm32g0;
+
+/// The control page page and the routes it talks to.
+///
+/// In the library rather than beside the handlers so a host test can read it.
+/// The page is the one part of this firmware that cannot be checked by running
+/// it — there is no browser on the bench — so what can be checked is that it
+/// stays small, stays self-contained, and only calls routes that exist.
+pub mod control page {
+    /// The page itself, served from flash.
+    ///
+    /// One file with no external references: the board is reached over its
+    /// own access point, which has no route to a CDN, so a page that pulled a
+    /// framework would render as a blank rectangle exactly when it is needed.
+    pub const PAGE: &str = include_str!("control page.html");
+
+    /// A validator computed at build time from the page.
+    ///
+    /// FNV-1a, which is a few lines and enough for the job: it only has to
+    /// change when the bytes change, not resist anyone choosing bytes to
+    /// collide with it.
+    #[must_use]
+    pub const fn fnv1a(bytes: &[u8]) -> u64 {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut index = 0;
+        while index < bytes.len() {
+            hash ^= bytes[index] as u64;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            index += 1;
+        }
+        hash
+    }
+
+    /// The page's ETag, so a reload costs a 304 rather than nine kilobytes
+    /// over the same access point that is carrying the jog commands.
+    pub const ETAG_HASH: u64 = fnv1a(PAGE.as_bytes());
+
+    /// Where the page is served.
+    pub const PATH: &str = "/actuator";
+    pub const STATUS: &str = "/api/v1/actuator";
+    pub const JOG: &str = "/api/v1/actuator/jog";
+    pub const MOVE: &str = "/api/v1/actuator/move";
+    pub const STOP: &str = "/api/v1/actuator/stop";
+    pub const RELEASE: &str = "/api/v1/actuator/release";
+
+    /// Every route the firmware answers on, for the page to be checked against.
+    pub const ROUTES: [&str; 5] = [STATUS, JOG, MOVE, STOP, RELEASE];
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn the_page_only_calls_routes_that_exist() {
+            // A mistyped path in the page is invisible until someone drags the
+            // pad and the motor does not move, with a 404 nobody is looking at.
+            let mut checked = 0;
+            let mut rest = PAGE;
+            while let Some(at) = rest.find("\"/api/") {
+                let tail = &rest[at + 1..];
+                let end = tail.find('"').expect("unterminated path literal");
+                let path = &tail[..end];
+                assert!(
+                    ROUTES.contains(&path),
+                    "the page calls {path}, which the firmware does not serve"
+                );
+                checked += 1;
+                rest = &tail[end..];
+            }
+            assert!(checked >= 5, "only found {checked} calls; did the page change shape?");
+        }
+
+        #[test]
+        fn the_page_fetches_nothing_from_outside_the_station() {
+            // The station is reached over its own access point, which has no
+            // route anywhere else. Anything loaded from a CDN is a spinner.
+            for marker in ["http://", "https://", "//cdn", "src=\"//"] {
+                assert!(
+                    !PAGE.contains(marker),
+                    "the page references {marker}, which will not resolve on the board's AP"
+                );
+            }
+        }
+
+        #[test]
+        fn the_page_stays_small_enough_to_serve_from_flash() {
+            // Not a hard limit, a tripwire. It is sent over an access point
+            // that is also carrying jog commands, so it doubling in size is
+            // something to notice rather than discover.
+            const BUDGET: usize = 16 * 1024;
+            assert!(
+                PAGE.len() <= BUDGET,
+                "the page is {} bytes, over the {BUDGET}-byte budget",
+                PAGE.len()
+            );
+        }
+
+        #[test]
+        fn the_validator_follows_the_content() {
+            // If this did not change with the bytes, a cached page would
+            // survive a firmware update and the control page would keep talking to
+            // routes that had moved.
+            assert_ne!(fnv1a(b"a"), fnv1a(b"b"));
+            assert_ne!(fnv1a(PAGE.as_bytes()), fnv1a(b""));
+            assert_eq!(ETAG_HASH, fnv1a(PAGE.as_bytes()));
+        }
+    }
+}
 pub mod swd;
 
 /// The wire contract, shared with the host tool rather than copied.

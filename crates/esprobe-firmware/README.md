@@ -109,7 +109,19 @@ inputs of one bridge reverses that winding, and the motor buzzes instead of
 turning.
 
 Open `http://<probe>/actuator` for a control page: drag left or right to jog, let go
-to stop. Or drive it directly:
+to stop. The page is served from flash by the same HTTP server as the API, in
+one file with no external references — the board is reached over its own
+access point, which has no route to a CDN, so a page that pulled a framework
+would be a blank rectangle exactly when it is needed. It carries an ETag derived
+from its own bytes, so a reload costs a 304 rather than nine kilobytes over the
+link that is also carrying the jog commands.
+
+Three host tests keep it that way: that it references nothing outside the
+station, that it only calls routes the firmware serves, and that it stays inside
+a size budget. The page is the one part that cannot be checked by running it —
+there is no browser on the bench — so what can be checked is checked.
+
+Or drive it directly:
 
 | Route | Method | Body |
 | --- | --- | --- |

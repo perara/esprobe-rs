@@ -1405,7 +1405,17 @@ mod app {
 
         spawn_network_bridge(hub.clone())?;
 
-        let mut server = EspHttpServer::new(&Default::default())?;
+        // Explicit rather than defaulted. The control page opens one connection for
+        // the page and then polls status while it is on screen, so a couple of
+        // phones plus a curl is the realistic load — and every socket is a
+        // buffer this chip pays for whether or not anything connects.
+        let mut server = EspHttpServer::new(&esp_idf_svc::http::server::Configuration {
+            stack_size: 8192,
+            max_open_sockets: 4,
+            max_uri_handlers: 24,
+            lru_purge_enable: true,
+            ..Default::default()
+        })?;
         register_handlers(&mut server, hub, wifi_control.clone(), actuator_planner)?;
         // Dropping `actuator` cancels its timer and the motor stops answering,
         // so it is held here for as long as the firmware runs.
@@ -1985,30 +1995,40 @@ mod app {
         }))
     }
 
-    /// The control page page, served from flash.
-    ///
-    /// One file with no external references: the board is reached over its
-    /// own access point, which has no route to a CDN, so a page that pulled a
-    /// framework would render as a blank rectangle exactly when it is needed.
-    const CONTROL_PAGE_PAGE: &str = include_str!("control page.html");
-
     /// actuator control: status, jog, bounded moves, stop, release.
     fn register_actuator_handlers(
         server: &mut EspHttpServer<'static>,
         actuator: crate::actuator_hw::Shared,
     ) -> Result<()> {
-        server.fn_handler("/actuator", Method::Get, move |req| {
+        server.fn_handler(esprobe_firmware::control page::PATH, Method::Get, move |req| {
+            let hash = esprobe_firmware::control page::ETAG_HASH;
+            let etag = format!("\"{hash:016x}\"");
+            // A phone that reloads the page should not pull it again over the
+            // same access point that is carrying the jog commands.
+            if req.header("If-None-Match").is_some_and(|tag| tag == etag) {
+                req.into_response(304, None, &[("ETag", etag.as_str())])?;
+                return Ok::<(), anyhow::Error>(());
+            }
+            // Content-Length rather than chunked: the length is known at build
+            // time, and a browser that knows it can render as the body lands
+            // instead of waiting for the terminating chunk.
+            let length = esprobe_firmware::control page::PAGE.len().to_string();
             let mut response = req.into_response(
                 200,
                 None,
-                &[("Content-Type", "text/html; charset=utf-8")],
+                &[
+                    ("Content-Type", "text/html; charset=utf-8"),
+                    ("Content-Length", length.as_str()),
+                    ("ETag", etag.as_str()),
+                    ("Cache-Control", "public, max-age=60, must-revalidate"),
+                ],
             )?;
-            response.write_all(CONTROL_PAGE_PAGE.as_bytes())?;
+            response.write_all(esprobe_firmware::control page::PAGE.as_bytes())?;
             Ok::<(), anyhow::Error>(())
         })?;
 
         let state = actuator.clone();
-        server.fn_handler("/api/v1/actuator", Method::Get, move |req| {
+        server.fn_handler(esprobe_firmware::control page::STATUS, Method::Get, move |req| {
             let body = {
                 let planner = state.lock().map_err(|_| anyhow!("actuator lock poisoned"))?;
                 format!(
@@ -2042,7 +2062,7 @@ mod app {
         }
 
         let state = actuator.clone();
-        server.fn_handler("/api/v1/actuator/jog", Method::Post, move |mut req| {
+        server.fn_handler(esprobe_firmware::control page::JOG, Method::Post, move |mut req| {
             let body = match read_body(&mut req) {
                 Ok(body) => body,
                 Err(error) => {
@@ -2068,7 +2088,7 @@ mod app {
         })?;
 
         let state = actuator.clone();
-        server.fn_handler("/api/v1/actuator/move", Method::Post, move |mut req| {
+        server.fn_handler(esprobe_firmware::control page::MOVE, Method::Post, move |mut req| {
             let body = match read_body(&mut req) {
                 Ok(body) => body,
                 Err(error) => {
@@ -2096,8 +2116,8 @@ mod app {
         })?;
 
         for (path, release) in [
-            ("/api/v1/actuator/stop", false),
-            ("/api/v1/actuator/release", true),
+            (esprobe_firmware::control page::STOP, false),
+            (esprobe_firmware::control page::RELEASE, true),
         ] {
             let state = actuator.clone();
             server.fn_handler(path, Method::Post, move |req| {
