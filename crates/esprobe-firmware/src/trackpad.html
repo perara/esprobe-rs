@@ -98,6 +98,8 @@
     <div class="row">
       <button id="selftest">Test pins</button>
       <button id="buzz">Buzz coils</button>
+      <button id="coilA">Wiggle A</button>
+      <button id="coilB">Wiggle B</button>
     </div>
     <p id="diag" class="sub" style="margin:10px 0 0">
       Nothing heard or felt while buzzing means no coil current &mdash; check VM
@@ -244,6 +246,36 @@
   // so a hand on the motor answers "is any current flowing at all".
   let buzzing = null;
   const buzzBtn = document.getElementById("buzz");
+
+  // One winding at a time. A motor that only twitches for one of these has one
+  // dead or miscabled coil, which is the fault that looks like "one click
+  // forward, one click back" - with a single coil the half-step sequence goes
+  // +,+,0,-,-,-,0,+ and never advances.
+  function coilTest(button, label, states) {
+    let timer = null, flip = 0;
+    button.addEventListener("click", () => {
+      stopWiggles(timer);
+      if (timer) { timer = null; button.textContent = label; return; }
+      timer = setInterval(() => {
+        post("/api/v1/stepper/hold", {state: states[flip++ % 2], seconds: 2});
+      }, 500);
+      wiggles.push(() => { clearInterval(timer); timer = null; button.textContent = label; });
+      button.textContent = "Stop " + label.split(" ")[1];
+      diag.textContent = "only coil " + label.slice(-1)
+        + " is energised. No movement here means this winding is open or miscabled.";
+    });
+  }
+  // Every wiggle stops the others: two coils driven by two independent timers
+  // would interleave holds and tell you nothing.
+  const wiggles = [];
+  function stopWiggles(keep) {
+    while (wiggles.length) { wiggles.pop()(); }
+    if (buzzing) { clearInterval(buzzing); buzzing = null; buzzBtn.textContent = "Buzz coils"; }
+    post("/api/v1/stepper/release", {});
+  }
+  coilTest(document.getElementById("coilA"), "Wiggle A", [0, 4]);
+  coilTest(document.getElementById("coilB"), "Wiggle B", [2, 6]);
+
   buzzBtn.addEventListener("click", () => {
     if (buzzing) {
       clearInterval(buzzing); buzzing = null;
@@ -252,6 +284,7 @@
       diag.textContent = "stopped.";
       return;
     }
+    stopWiggles();
     let flip = 0;
     // `seconds` outlives the interval on purpose: if this page dies mid-buzz
     // the firmware releases the windings on its own rather than holding
