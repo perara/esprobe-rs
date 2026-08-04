@@ -1344,7 +1344,13 @@ mod app {
 
         let mut reset_all = PinDriver::input_output(take(pinmap::RESET_ALL)?, Pull::Floating)?;
         reset_all.set_low()?;
-        Hub::set_gpio_direction(7, gpio_mode_t_GPIO_MODE_INPUT)?;
+        // The pin this releases is `RESET_ALL`, whichever pin that is. It was
+        // written as a literal 7 when 7 was `RESET_ALL` on the v1.0 board; on
+        // revision 2 that signal is GPIO21 and GPIO7 is the stepper's `AIN1`,
+        // so the literal had quietly become "set one of the motor bridges back
+        // to an input". Only the ordering saved it — the stepper claims its
+        // pins later — which is not a thing to rely on.
+        Hub::set_gpio_direction(pinmap::RESET_ALL, gpio_mode_t_GPIO_MODE_INPUT)?;
 
         let display = UartDriver::new(
             peripherals.uart1,
@@ -1354,7 +1360,9 @@ mod app {
             Option::<esp_idf_svc::hal::gpio::AnyIOPin>::None,
             &UartConfig::new().baudrate(Hertz(115_200)),
         )?;
-        Hub::set_gpio_direction(5, gpio_mode_t_GPIO_MODE_INPUT)?;
+        // Likewise: 5 was `DISP_TX` on the v1.0 board and is the stepper's
+        // `BIN2` on revision 2.
+        Hub::set_gpio_direction(pinmap::DISP_TX, gpio_mode_t_GPIO_MODE_INPUT)?;
         let swd = EspSwdIo::new(
             take(pinmap::PROG_SWDIO)?,
             take(pinmap::PROG_SWCLK)?,
