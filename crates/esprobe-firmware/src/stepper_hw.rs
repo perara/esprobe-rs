@@ -20,7 +20,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use esp_idf_svc::hal::gpio::{AnyIOPin, PinDriver};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+use esp_idf_svc::hal::gpio::{AnyIOPin, PinDriver, Pull};
 use esp_idf_svc::timer::{EspTaskTimerService, EspTimer};
 
 use esprobe_firmware::stepper::{Coils, Planner, StepMode};
@@ -33,6 +35,33 @@ pub const POLL_PERIOD_US: u64 = 500;
 
 /// The planner, shared with the HTTP handlers.
 pub type Shared = Arc<Mutex<Planner>>;
+
+/// Asked for by the HTTP handler, performed by the timer.
+///
+/// The pins are owned by the timer callback and nothing else can touch them —
+/// which is the right arrangement, and means a self-test cannot simply reach in
+/// and drive them. So it is requested with a flag and answered with one, rather
+/// than by handing the pins around behind a second lock that would have to be
+/// taken in the right order against the planner's.
+static SELFTEST_REQUEST: AtomicBool = AtomicBool::new(false);
+static SELFTEST_DONE: AtomicBool = AtomicBool::new(false);
+/// Two bits per pin, in `AIN1, AIN2, BIN1, BIN2` order: bit 0 of each pair is
+/// "read back high when driven high", bit 1 "read back low when driven low".
+static SELFTEST_RESULT: AtomicU32 = AtomicU32::new(0);
+
+/// Ask the timer to drive each bridge pin and read the pad back.
+pub fn request_selftest() {
+    SELFTEST_DONE.store(false, Ordering::Relaxed);
+    SELFTEST_REQUEST.store(true, Ordering::Relaxed);
+}
+
+/// The result, once the timer has performed it.
+#[must_use]
+pub fn selftest_result() -> Option<u32> {
+    SELFTEST_DONE
+        .load(Ordering::Relaxed)
+        .then(|| SELFTEST_RESULT.load(Ordering::Relaxed))
+}
 
 /// A running stepper: the timer must outlive it or the motor stops.
 pub struct Stepper {
@@ -60,10 +89,14 @@ pub fn start(
     bin1: AnyIOPin<'static>,
     bin2: AnyIOPin<'static>,
 ) -> Result<Stepper> {
-    let mut ain1 = PinDriver::output(ain1).context("STEP_AIN1")?;
-    let mut ain2 = PinDriver::output(ain2).context("STEP_AIN2")?;
-    let mut bin1 = PinDriver::output(bin1).context("STEP_BIN1")?;
-    let mut bin2 = PinDriver::output(bin2).context("STEP_BIN2")?;
+    // `input_output`, not `output`, so the pad can be read back. It costs
+    // nothing to drive and it is the only way this firmware can answer "am I
+    // actually driving these pins" without somebody holding a meter — which is
+    // a question that came up and which I could not answer.
+    let mut ain1 = PinDriver::input_output(ain1, Pull::Floating).context("STEP_AIN1")?;
+    let mut ain2 = PinDriver::input_output(ain2, Pull::Floating).context("STEP_AIN2")?;
+    let mut bin1 = PinDriver::input_output(bin1, Pull::Floating).context("STEP_BIN1")?;
+    let mut bin2 = PinDriver::input_output(bin2, Pull::Floating).context("STEP_BIN2")?;
 
     // Coast before anything else. A DRV8833 comes out of reset with its inputs
     // undefined, and the first thing a motor should do is nothing.
@@ -90,6 +123,40 @@ pub fn start(
                 Ok(mut planner) => planner.poll(now_us).coils,
                 Err(_) => Coils::RELEASED,
             };
+
+            if SELFTEST_REQUEST.swap(false, Ordering::Relaxed) {
+                let mut bits = 0u32;
+                // One pin at a time, so a short between two of them shows up as
+                // the wrong pin failing rather than as everything failing.
+                macro_rules! check {
+                    ($pin:expr, $slot:expr) => {{
+                        let _ = $pin.set_high();
+                        esp_idf_svc::hal::delay::Ets::delay_us(50);
+                        if $pin.is_high() {
+                            bits |= 1 << ($slot * 2);
+                        }
+                        let _ = $pin.set_low();
+                        esp_idf_svc::hal::delay::Ets::delay_us(50);
+                        if $pin.is_low() {
+                            bits |= 1 << ($slot * 2 + 1);
+                        }
+                    }};
+                }
+                check!(ain1, 0);
+                check!(ain2, 1);
+                check!(bin1, 2);
+                check!(bin2, 3);
+                SELFTEST_RESULT.store(bits, Ordering::Relaxed);
+                SELFTEST_DONE.store(true, Ordering::Relaxed);
+                // The pins were just driven behind the planner's back, so make
+                // the cache disagree and let the next poll write them properly.
+                last = Coils {
+                    ain1: true,
+                    ain2: true,
+                    bin1: true,
+                    bin2: true,
+                };
+            }
 
             // Only touch the pins when something changed. At two kilohertz
             // against step rates in the hundreds, most polls change nothing,

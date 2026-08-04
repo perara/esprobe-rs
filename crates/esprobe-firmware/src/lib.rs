@@ -51,9 +51,11 @@ pub mod trackpad {
     pub const RELEASE: &str = "/api/v1/stepper/release";
     /// Hold one excitation state so the bridges can be measured.
     pub const HOLD: &str = "/api/v1/stepper/hold";
+    /// Drive each bridge pin and read the pad back.
+    pub const SELFTEST: &str = "/api/v1/stepper/selftest";
 
     /// Every route the firmware answers on, for the page to be checked against.
-    pub const ROUTES: [&str; 6] = [STATUS, JOG, MOVE, STOP, RELEASE, HOLD];
+    pub const ROUTES: [&str; 7] = [STATUS, JOG, MOVE, STOP, RELEASE, HOLD, SELFTEST];
 
     #[cfg(test)]
     mod tests {

@@ -2162,6 +2162,67 @@ mod app {
             },
         )?;
 
+        let state = stepper.clone();
+        server.fn_handler(
+            esprobe_firmware::trackpad::SELFTEST,
+            Method::Post,
+            move |req| {
+                // Stop first: the pins are about to be driven behind the
+                // planner's back, and a motor mid-move would take whatever
+                // pattern the test leaves between its steps.
+                let now = unsafe { esp_idf_svc::sys::esp_timer_get_time() } as u64;
+                state
+                    .lock()
+                    .map_err(|_| anyhow!("stepper lock poisoned"))?
+                    .release(now);
+
+                crate::stepper_hw::request_selftest();
+                // The timer runs every 500us, so this is a handful of passes.
+                let mut bits = None;
+                for _ in 0..200 {
+                    if let Some(result) = crate::stepper_hw::selftest_result() {
+                        bits = Some(result);
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                let Some(bits) = bits else {
+                    req.into_status_response(503)?
+                        .write_all(b"{\"ok\":false,\"error\":\"the stepper timer did not answer\"}\n")?;
+                    return Ok::<(), anyhow::Error>(());
+                };
+
+                let pin = |slot: u32| (bits >> (slot * 2)) & 0b11;
+                let name = ["ain1", "ain2", "bin1", "bin2"];
+                let gpio = [
+                    pinmap::STEP_AIN1,
+                    pinmap::STEP_AIN2,
+                    pinmap::STEP_BIN1,
+                    pinmap::STEP_BIN2,
+                ];
+                let mut body = String::from("{\"ok\":true,\"pins\":[");
+                for slot in 0..4u32 {
+                    let bits = pin(slot);
+                    if slot > 0 {
+                        body.push(',');
+                    }
+                    body.push_str(&format!(
+                        "{{\"name\":\"{}\",\"gpio\":{},\"drove_high\":{},\"drove_low\":{}}}",
+                        name[slot as usize],
+                        gpio[slot as usize],
+                        bits & 1 != 0,
+                        bits & 0b10 != 0
+                    ));
+                }
+                // All four passing means the pads follow what is written to
+                // them. It does not mean anything past the pad is right.
+                let all_ok = (0..4).all(|slot| pin(slot) == 0b11);
+                body.push_str(&format!("],\"all_pins_drive\":{all_ok}}}\n"));
+                req.into_ok_response()?.write_all(body.as_bytes())?;
+                Ok::<(), anyhow::Error>(())
+            },
+        )?;
+
         for (path, release) in [
             (esprobe_firmware::trackpad::STOP, false),
             (esprobe_firmware::trackpad::RELEASE, true),
