@@ -77,6 +77,11 @@
       <input id="cap" type="range" min="20" max="1000" step="10" value="400">
       <span id="capval" style="width:5.5em;text-align:right">400/s</span>
     </label>
+    <label style="margin-top:8px">
+      response
+      <input id="accel" type="range" min="400" max="20000" step="400" value="4000">
+      <span id="accelval" style="width:5.5em;text-align:right">4000/s&sup2;</span>
+    </label>
   </div>
 
   <div class="card">
@@ -137,6 +142,24 @@
   capEl.addEventListener("input", () => {
     cap = Number(capEl.value);
     capVal.textContent = cap + "/s";
+  });
+
+  // How hard it is allowed to accelerate. The right value belongs to the motor,
+  // its supply and whatever is bolted to the shaft, none of which the firmware
+  // can see - so it is a slider to turn while the thing runs, and the symptom
+  // of going too far is a motor that buzzes without turning.
+  const accelEl = document.getElementById("accel");
+  const accelVal = document.getElementById("accelval");
+  let accelPending = null;
+  accelEl.addEventListener("input", () => {
+    accelVal.textContent = accelEl.value + "/s\u00b2";
+    // Dragging a slider fires continuously; one request per pixel would queue
+    // behind itself on four sockets and make the pad stutter.
+    clearTimeout(accelPending);
+    accelPending = setTimeout(() => {
+      post("/api/v1/stepper/config", {accel: Number(accelEl.value)});
+      accelPending = null;
+    }, 80);
   });
 
   async function post(path, body) {
@@ -305,6 +328,12 @@
       document.getElementById("pos").textContent = s.position;
       document.getElementById("rate").textContent = s.steps_per_s + " steps/s";
       document.getElementById("rem").textContent = s.remaining === null ? "—" : s.remaining;
+      // Only while the slider is idle: adopting the firmware's value mid-drag
+      // would fight the finger holding it.
+      if (accelPending === null && Number(accelEl.value) !== s.accel && s.accel !== undefined) {
+        accelEl.value = s.accel;
+        accelVal.textContent = s.accel + "/s\u00b2";
+      }
       if (Number(capEl.max) !== s.max_steps_per_s) {
         capEl.max = s.max_steps_per_s;
         if (cap > s.max_steps_per_s) { capEl.value = s.max_steps_per_s; capEl.dispatchEvent(new Event("input")); }

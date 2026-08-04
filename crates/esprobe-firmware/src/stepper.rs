@@ -174,10 +174,37 @@ pub const JOG_TIMEOUT_US: u64 = 400_000;
 /// looks exactly like a wiring fault, which is a bad thing for a bench to be
 /// unable to tell apart.
 ///
-/// So every rate change is ramped. This value is deliberately gentle — it
-/// reaches the default trackpad speed in about a second, and a motor that can
-/// do better loses nothing but a moment.
-pub const ACCEL_STEPS_PER_S2: i32 = 400;
+/// So every rate change is ramped. The default reaches the trackpad's default
+/// speed in about a tenth of a second, which is fast enough that a pad feels
+/// connected to the shaft rather than to a suggestion box.
+///
+/// This is a *default*, not a limit: the rate a given motor can be accelerated
+/// at depends on its inertia, its supply and what is bolted to it, none of
+/// which the firmware can see. [`Planner::set_accel`] tunes it at runtime so
+/// finding the value just short of stalling costs a slider drag rather than a
+/// reflash.
+pub const ACCEL_STEPS_PER_S2: i32 = 4_000;
+
+/// How hard the rate is brought *down*.
+///
+/// Deliberately far higher than the acceleration, and not a knob. Overshooting
+/// on the way up makes a motor slip, because the field is asked to be somewhere
+/// the rotor has not reached yet. Coming down has no such failure: the field
+/// waits and the rotor arrives, helped rather than hindered by friction. Ramping
+/// both at one gentle rate is what made the pad feel disconnected — releasing it
+/// took as long as pushing it, and a flick from full forward to full reverse had
+/// to crawl through zero twice.
+pub const DECEL_STEPS_PER_S2: i32 = 20_000;
+
+/// Bounds on the runtime acceleration.
+///
+/// The floor keeps a mistyped zero from wedging the ramp so it never reaches
+/// its target. The ceiling is where acceleration stops meaning anything: past
+/// the point where a single poll covers the whole range, the ramp is a step
+/// change and asking for more is asking for nothing.
+pub const MIN_ACCEL_STEPS_PER_S2: i32 = 100;
+/// See [`MIN_ACCEL_STEPS_PER_S2`].
+pub const MAX_ACCEL_STEPS_PER_S2: i32 = 200_000;
 
 /// The rate a stepper can start from rest without ramping to it.
 ///
@@ -240,6 +267,9 @@ pub struct Planner {
     /// When holding position stops and the windings are released.
     release_at_us: u64,
     holding: bool,
+    /// How hard to accelerate, in steps per second squared. Tunable because the
+    /// right value is a property of the machine, not of this code.
+    accel: i32,
 }
 
 impl Default for Planner {
@@ -262,7 +292,29 @@ impl Planner {
             last_step_us: 0,
             release_at_us: 0,
             holding: false,
+            accel: ACCEL_STEPS_PER_S2,
         }
+    }
+
+    /// How hard the rate is currently ramped up.
+    #[must_use]
+    pub const fn accel(&self) -> i32 {
+        self.accel
+    }
+
+    /// Retune the acceleration, clamped to something that still ramps.
+    ///
+    /// Takes effect on the next poll, including part-way through a move: the
+    /// point is to turn the knob while the motor runs and hear where it starts
+    /// to slip.
+    pub const fn set_accel(&mut self, steps_per_s2: i32) {
+        self.accel = if steps_per_s2 < MIN_ACCEL_STEPS_PER_S2 {
+            MIN_ACCEL_STEPS_PER_S2
+        } else if steps_per_s2 > MAX_ACCEL_STEPS_PER_S2 {
+            MAX_ACCEL_STEPS_PER_S2
+        } else {
+            steps_per_s2
+        };
     }
 
     #[must_use]
@@ -348,9 +400,21 @@ impl Planner {
             return;
         }
         let elapsed = now_us.saturating_sub(self.ramped_at_us);
+        // Slowing down is not the reverse of speeding up, so it does not get the
+        // same rate. Reversing counts as slowing until the rate reaches zero,
+        // which is what stops a flick from one side of the pad to the other from
+        // spending a second crawling through the middle.
+        //
+        // `rate == 0` is the accelerating case: `signum()` is zero there, and
+        // without this guard a standing start compares 0 against 1, reads as a
+        // reversal, and leaves rest under the braking rate.
+        let slowing = self.rate != 0
+            && (self.target_rate.signum() != self.rate.signum()
+                || self.target_rate.abs() < self.rate.abs());
+        let accel = if slowing { DECEL_STEPS_PER_S2 } else { self.accel };
         // Integer division: below this the change rounds to zero and the ramp
         // would stall, so leave the clock alone and let it accumulate.
-        let change = ((elapsed as i64 * ACCEL_STEPS_PER_S2 as i64) / 1_000_000) as i32;
+        let change = ((elapsed as i64 * accel as i64) / 1_000_000) as i32;
         if change == 0 {
             return;
         }
@@ -757,10 +821,122 @@ mod tests {
             }
         }
         let at = reached.expect("never reached the requested rate");
-        // 800 steps/s at 400 steps/s^2 is about two seconds.
+        // Derived from the constant rather than written out, so retuning the
+        // ramp does not fail a test that was only ever asserting arithmetic.
+        let want = (800 - START_STEPS_PER_S) as u64 * 1_000_000 / ACCEL_STEPS_PER_S2 as u64;
         assert!(
-            (1_500_000..2_500_000).contains(&at),
-            "reached full rate at {at}us, which is not the ramp we asked for"
+            at.abs_diff(want) < want / 2 + 20_000,
+            "reached full rate at {at}us, expected about {want}us"
+        );
+    }
+
+    #[test]
+    fn slowing_down_is_quicker_than_speeding_up() {
+        // The pad felt disconnected because letting go took as long as pushing.
+        // Braking cannot make a motor slip the way accelerating can, so it is
+        // not held to the same rate.
+        let mut p = Planner::new(StepMode::Half);
+        let mut up = None;
+        for t in 0..5 * SEC {
+            if t % 100_000 == 0 {
+                p.jog(800, t);
+            }
+            p.poll(t);
+            if p.rate() == 800 {
+                up = Some(t);
+                break;
+            }
+        }
+        let up = up.expect("never got up to speed");
+
+        let mut down = None;
+        for t in up..up + 5 * SEC {
+            if t % 100_000 == 0 {
+                p.jog(100, t);
+            }
+            p.poll(t);
+            if p.rate() == 100 {
+                down = Some(t - up);
+                break;
+            }
+        }
+        let down = down.expect("never came back down");
+        assert!(
+            down * 2 < up,
+            "took {down}us to slow down against {up}us to speed up; braking is not\n\
+             meaningfully quicker, which is the thing that made the pad feel laggy"
+        );
+    }
+
+    #[test]
+    fn a_flick_across_the_pad_does_not_crawl_through_the_middle() {
+        // Full forward to full reverse is the worst case: it has to unwind the
+        // whole rate and build it again. Under one ramp for both halves this
+        // took seconds, and the motor kept going the wrong way throughout.
+        let mut p = Planner::new(StepMode::Half);
+        for t in 0..2 * SEC {
+            if t % 100_000 == 0 {
+                p.jog(800, t);
+            }
+            p.poll(t);
+        }
+        assert_eq!(p.rate(), 800, "did not reach the rate to reverse from");
+
+        let mut crossed = None;
+        for t in 2 * SEC..4 * SEC {
+            if t % 100_000 == 0 {
+                p.jog(-800, t);
+            }
+            p.poll(t);
+            if p.rate() <= 0 && crossed.is_none() {
+                crossed = Some(t - 2 * SEC);
+            }
+        }
+        let crossed = crossed.expect("never stopped going forwards");
+        assert!(
+            crossed < 150_000,
+            "took {crossed}us just to stop going forwards after a full reversal"
+        );
+    }
+
+    #[test]
+    fn the_acceleration_can_be_retuned_and_is_clamped() {
+        let mut p = Planner::new(StepMode::Half);
+        assert_eq!(p.accel(), ACCEL_STEPS_PER_S2);
+
+        p.set_accel(1_000);
+        assert_eq!(p.accel(), 1_000);
+
+        // A mistyped zero must not wedge the ramp below the point where integer
+        // division rounds every change to nothing.
+        p.set_accel(0);
+        assert_eq!(p.accel(), MIN_ACCEL_STEPS_PER_S2);
+        p.set_accel(-5_000);
+        assert_eq!(p.accel(), MIN_ACCEL_STEPS_PER_S2);
+        p.set_accel(i32::MAX);
+        assert_eq!(p.accel(), MAX_ACCEL_STEPS_PER_S2);
+    }
+
+    #[test]
+    fn a_gentler_acceleration_actually_takes_longer() {
+        // The knob has to reach the ramp, not just be stored.
+        let time_to_speed = |accel: i32| {
+            let mut p = Planner::new(StepMode::Half);
+            p.set_accel(accel);
+            for t in 0..10 * SEC {
+                if t % 100_000 == 0 {
+                    p.jog(800, t);
+                }
+                p.poll(t);
+                if p.rate() == 800 {
+                    return t;
+                }
+            }
+            panic!("never reached the rate at {accel} steps/s^2");
+        };
+        assert!(
+            time_to_speed(500) > time_to_speed(8_000) * 4,
+            "the acceleration setting is not reaching the ramp"
         );
     }
 

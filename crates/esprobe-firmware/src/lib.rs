@@ -53,9 +53,11 @@ pub mod trackpad {
     pub const HOLD: &str = "/api/v1/stepper/hold";
     /// Drive each bridge pin and read the pad back.
     pub const SELFTEST: &str = "/api/v1/stepper/selftest";
+    /// Retune the acceleration while the motor runs.
+    pub const CONFIG: &str = "/api/v1/stepper/config";
 
     /// Every route the firmware answers on, for the page to be checked against.
-    pub const ROUTES: [&str; 7] = [STATUS, JOG, MOVE, STOP, RELEASE, HOLD, SELFTEST];
+    pub const ROUTES: [&str; 8] = [STATUS, JOG, MOVE, STOP, RELEASE, HOLD, SELFTEST, CONFIG];
 
     #[cfg(test)]
     mod tests {

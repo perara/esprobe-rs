@@ -2040,7 +2040,8 @@ mod app {
                 let planner = state.lock().map_err(|_| anyhow!("stepper lock poisoned"))?;
                 format!(
                     "{{\"ok\":true,\"position\":{},\"steps_per_s\":{},\"moving\":{},\
-                     \"remaining\":{},\"max_steps_per_s\":{}}}\n",
+                     \"remaining\":{},\"max_steps_per_s\":{},\"accel\":{},\
+                     \"min_accel\":{},\"max_accel\":{}}}\n",
                     planner.position(),
                     planner.rate(),
                     planner.is_moving(),
@@ -2049,6 +2050,9 @@ mod app {
                         None => String::from("null"),
                     },
                     esprobe_firmware::stepper::MAX_STEPS_PER_S,
+                    planner.accel(),
+                    esprobe_firmware::stepper::MIN_ACCEL_STEPS_PER_S2,
+                    esprobe_firmware::stepper::MAX_ACCEL_STEPS_PER_S2,
                 )
             };
             req.into_ok_response()?.write_all(body.as_bytes())?;
@@ -2161,6 +2165,36 @@ mod app {
                 Ok::<(), anyhow::Error>(())
             },
         )?;
+
+        let state = stepper.clone();
+        server.fn_handler(esprobe_firmware::trackpad::CONFIG, Method::Post, move |mut req| {
+            let body = match read_body(&mut req) {
+                Ok(body) => body,
+                Err(err) => {
+                    req.into_status_response(400)?
+                        .write_all(format!("{{\"ok\":false,\"error\":\"{err}\"}}\n").as_bytes())?;
+                    return Ok::<(), anyhow::Error>(());
+                }
+            };
+            // Clamped in the planner rather than here, so the bounds cannot
+            // drift apart from the ramp that has to honour them.
+            let accel = match esprobe_firmware::stepper::json_i32(&body, "accel") {
+                Some(accel) => accel,
+                None => {
+                    req.into_status_response(400)?
+                        .write_all(b"{\"ok\":false,\"error\":\"expected an accel field\"}\n")?;
+                    return Ok::<(), anyhow::Error>(());
+                }
+            };
+            let applied = {
+                let mut planner = state.lock().map_err(|_| anyhow!("stepper lock poisoned"))?;
+                planner.set_accel(accel);
+                planner.accel()
+            };
+            req.into_ok_response()?
+                .write_all(format!("{{\"ok\":true,\"accel\":{applied}}}\n").as_bytes())?;
+            Ok::<(), anyhow::Error>(())
+        })?;
 
         let state = stepper.clone();
         server.fn_handler(
