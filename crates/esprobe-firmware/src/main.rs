@@ -1405,7 +1405,17 @@ mod app {
 
         spawn_network_bridge(hub.clone())?;
 
-        let mut server = EspHttpServer::new(&Default::default())?;
+        // Explicit rather than defaulted. The trackpad opens one connection for
+        // the page and then polls status while it is on screen, so a couple of
+        // phones plus a curl is the realistic load — and every socket is a
+        // buffer this chip pays for whether or not anything connects.
+        let mut server = EspHttpServer::new(&esp_idf_svc::http::server::Configuration {
+            stack_size: 8192,
+            max_open_sockets: 4,
+            max_uri_handlers: 24,
+            lru_purge_enable: true,
+            ..Default::default()
+        })?;
         register_handlers(&mut server, hub, wifi_control.clone(), stepper_planner)?;
         // Dropping `stepper` cancels its timer and the motor stops answering,
         // so it is held here for as long as the firmware runs.
@@ -1985,30 +1995,40 @@ mod app {
         }))
     }
 
-    /// The trackpad page, served from flash.
-    ///
-    /// One file with no external references: the station is reached over its
-    /// own access point, which has no route to a CDN, so a page that pulled a
-    /// framework would render as a blank rectangle exactly when it is needed.
-    const TRACKPAD_PAGE: &str = include_str!("trackpad.html");
-
     /// Stepper control: status, jog, bounded moves, stop, release.
     fn register_stepper_handlers(
         server: &mut EspHttpServer<'static>,
         stepper: crate::stepper_hw::Shared,
     ) -> Result<()> {
-        server.fn_handler("/stepper", Method::Get, move |req| {
+        server.fn_handler(esprobe_firmware::trackpad::PATH, Method::Get, move |req| {
+            let hash = esprobe_firmware::trackpad::ETAG_HASH;
+            let etag = format!("\"{hash:016x}\"");
+            // A phone that reloads the page should not pull it again over the
+            // same access point that is carrying the jog commands.
+            if req.header("If-None-Match").is_some_and(|tag| tag == etag) {
+                req.into_response(304, None, &[("ETag", etag.as_str())])?;
+                return Ok::<(), anyhow::Error>(());
+            }
+            // Content-Length rather than chunked: the length is known at build
+            // time, and a browser that knows it can render as the body lands
+            // instead of waiting for the terminating chunk.
+            let length = esprobe_firmware::trackpad::PAGE.len().to_string();
             let mut response = req.into_response(
                 200,
                 None,
-                &[("Content-Type", "text/html; charset=utf-8")],
+                &[
+                    ("Content-Type", "text/html; charset=utf-8"),
+                    ("Content-Length", length.as_str()),
+                    ("ETag", etag.as_str()),
+                    ("Cache-Control", "public, max-age=60, must-revalidate"),
+                ],
             )?;
-            response.write_all(TRACKPAD_PAGE.as_bytes())?;
+            response.write_all(esprobe_firmware::trackpad::PAGE.as_bytes())?;
             Ok::<(), anyhow::Error>(())
         })?;
 
         let state = stepper.clone();
-        server.fn_handler("/api/v1/stepper", Method::Get, move |req| {
+        server.fn_handler(esprobe_firmware::trackpad::STATUS, Method::Get, move |req| {
             let body = {
                 let planner = state.lock().map_err(|_| anyhow!("stepper lock poisoned"))?;
                 format!(
@@ -2042,7 +2062,7 @@ mod app {
         }
 
         let state = stepper.clone();
-        server.fn_handler("/api/v1/stepper/jog", Method::Post, move |mut req| {
+        server.fn_handler(esprobe_firmware::trackpad::JOG, Method::Post, move |mut req| {
             let body = match read_body(&mut req) {
                 Ok(body) => body,
                 Err(error) => {
@@ -2068,7 +2088,7 @@ mod app {
         })?;
 
         let state = stepper.clone();
-        server.fn_handler("/api/v1/stepper/move", Method::Post, move |mut req| {
+        server.fn_handler(esprobe_firmware::trackpad::MOVE, Method::Post, move |mut req| {
             let body = match read_body(&mut req) {
                 Ok(body) => body,
                 Err(error) => {
@@ -2096,8 +2116,8 @@ mod app {
         })?;
 
         for (path, release) in [
-            ("/api/v1/stepper/stop", false),
-            ("/api/v1/stepper/release", true),
+            (esprobe_firmware::trackpad::STOP, false),
+            (esprobe_firmware::trackpad::RELEASE, true),
         ] {
             let state = stepper.clone();
             server.fn_handler(path, Method::Post, move |req| {
