@@ -139,6 +139,11 @@ impl Sequencer {
         }
     }
 
+    /// Jump to a numbered state, for driving a known pattern on purpose.
+    pub const fn set_index(&mut self, index: u8) {
+        self.index = index % self.mode.states();
+    }
+
     /// Move one step. `forward` picks the direction; the index wraps.
     pub const fn advance(&mut self, forward: bool) -> Coils {
         let n = self.mode.states();
@@ -171,6 +176,14 @@ pub const JOG_TIMEOUT_US: u64 = 400_000;
 /// `stepper_hw::POLL_PERIOD_US` buys nothing: the steps would just bunch onto
 /// the poll boundaries.
 pub const MAX_STEPS_PER_S: u32 = 1_000;
+
+/// The longest a diagnostic hold will energise a winding.
+///
+/// This exists to be measured with a meter, and a meter takes seconds, not
+/// minutes. Without current limiting the winding is a resistor across the
+/// supply for as long as it is held, so the hold ends by itself whatever the
+/// caller asked for and whether or not anyone is still listening.
+pub const MAX_HOLD_US: u64 = 10_000_000;
 
 /// What the driver should be doing right now.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -292,6 +305,23 @@ impl Planner {
         if self.holding {
             self.release_at_us = now_us + HOLD_AFTER_MOTION_US;
         }
+    }
+
+    /// Hold one excitation state so the bridges can be measured.
+    ///
+    /// Not part of driving a motor: this is for putting a meter on `AOUT`/`BOUT`
+    /// and finding out whether the driver responds to its inputs at all. In
+    /// half-step, state 0 energises coil A alone and state 2 coil B alone,
+    /// which is what isolates one bridge from the other.
+    ///
+    /// Always bounded by [`MAX_HOLD_US`].
+    pub fn hold_state(&mut self, state: u8, hold_us: u64, now_us: u64) {
+        self.rate = 0;
+        self.remaining = None;
+        self.expires_at_us = u64::MAX;
+        self.seq.set_index(state);
+        self.holding = true;
+        self.release_at_us = now_us + hold_us.min(MAX_HOLD_US);
     }
 
     /// Drop the windings now, without waiting for the hold to expire.
@@ -582,6 +612,31 @@ mod tests {
         assert!(p.is_moving());
         p.jog(0, 1_000);
         assert!(!p.is_moving(), "a dead-zone release did not stop it");
+    }
+
+    #[test]
+    fn a_diagnostic_hold_energises_then_lets_go_on_its_own() {
+        let mut p = Planner::new(StepMode::Half);
+        // State 0 is coil A alone, which is what isolates one bridge.
+        p.hold_state(0, 3 * SEC, 0);
+        let held = p.poll(1_000).coils;
+        assert!(held.ain1 || held.ain2, "coil A was not energised");
+        assert!(!held.bin1 && !held.bin2, "coil B should be off in state 0");
+        assert!(p.poll(3 * SEC - 1).coils.energised(), "it let go early");
+        assert_eq!(
+            p.poll(3 * SEC + 1).coils,
+            Coils::RELEASED,
+            "a diagnostic hold has to end by itself"
+        );
+    }
+
+    #[test]
+    fn a_hold_cannot_be_asked_to_last_forever() {
+        let mut p = Planner::new(StepMode::Half);
+        // Without current limiting the winding is a resistor across the supply,
+        // so an absurd request is clamped rather than honoured.
+        p.hold_state(0, u64::MAX, 0);
+        assert_eq!(p.poll(MAX_HOLD_US + 1).coils, Coils::RELEASED);
     }
 
     #[test]
