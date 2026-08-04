@@ -36,9 +36,9 @@ assignment below.
 
 | Signal | Default |
 | --- | ---: |
-| `PROG_SWDIO` | GPIO4 |
-| `PROG_SWCLK` | GPIO3 |
-| `RESET_ALL` | GPIO7 |
+| `PROG_SWDIO` | GPIO1 |
+| `PROG_SWCLK` | GPIO2 |
+| `RESET_ALL` | GPIO21 |
 
 ```bash
 PIN_SWDIO=1 PIN_SWCLK=2 PIN_RESET_ALL=21 ./scripts/build.sh
@@ -66,17 +66,69 @@ them. They are harmless if the pins are unused, and will be feature-gated
 rather than left as permanent furniture. The rest of the HTTP API — liveness,
 identify, program — works on any board; see [HTTP control API](#http-control-api).
 
-## Board-specific pin map (the original board)
+## Board-specific pin map
 
-| Signal | ESP32-C3 |
-| --- | ---: |
-| `DISP_TX` | GPIO5 |
-| `DISP_RX` | GPIO6 |
-| `RESET_ALL` (originally supplied as `AUX_0_RST`) | GPIO7 |
-| `PROG_SWDIO` | GPIO4 |
-| `PROG_SWCLK` | GPIO3 |
-| `ASW_S1` | GPIO2 |
-| `ASW_S0` | GPIO1 |
+The defaults are revision 2, which is what `esprobe pin-map` reports off a
+board. They were the v1.0 schematic for a long time after the hardware moved,
+because every deployed image was built with `PIN_*` overrides and nothing
+compared the two — so reading the source to find which pin a signal was on gave
+the wrong answer. `the_default_pinmap_is_what_a_board_reports` now fails if they
+drift apart again.
+
+| Signal | ESP32-C3 | v1.0 was |
+| --- | ---: | ---: |
+| `STEP_BIN1` | GPIO0 | — |
+| `PROG_SWDIO` | GPIO1 | GPIO4 |
+| `PROG_SWCLK` | GPIO2 | GPIO3 |
+| `DISP_RX` | GPIO3 | GPIO6 |
+| `DISP_TX` | GPIO4 | GPIO5 |
+| `STEP_BIN2` | GPIO5 | — |
+| `STEP_AIN2` | GPIO6 | — |
+| `STEP_AIN1` | GPIO7 | — |
+| `ASW_S0` | GPIO10 | GPIO1 |
+| `ASW_S1` | GPIO20 | GPIO2 |
+| `RESET_ALL` (originally supplied as `AUX_0_RST`) | GPIO21 | GPIO7 |
+
+A v1.0 board still builds:
+
+```bash
+PIN_SWDIO=4 PIN_SWCLK=3 PIN_RESET_ALL=7 PIN_ASW_S0=1 PIN_ASW_S1=2 \
+  PIN_DISP_TX=5 PIN_DISP_RX=6 ./scripts/build.sh
+```
+
+GPIO12-17 are the SPI flash and GPIO18/19 are the USB pair the probe is reached
+over; a test rejects any claimed pin in either range, because driving one of
+those does not produce a signal, it produces a brick.
+
+## The actuator station
+
+Four of the pins revision 2 left free drive a motor driver, one H-bridge per winding:
+`AIN1`/`AIN2` on GPIO7/GPIO6 for coil A, `BIN1`/`BIN2` on GPIO0/GPIO5 for coil
+B. The two halves of a winding must stay on the same bridge — swapping the two
+inputs of one bridge reverses that winding, and the motor buzzes instead of
+turning.
+
+Open `http://<probe>/actuator` for a control page: drag left or right to jog, let go
+to stop. Or drive it directly:
+
+| Route | Method | Body |
+| --- | --- | --- |
+| `/api/v1/actuator` | GET | — |
+| `/api/v1/actuator/jog` | POST | `{"steps_per_s":-250}` |
+| `/api/v1/actuator/move` | POST | `{"steps":200,"steps_per_s":400}` |
+| `/api/v1/actuator/stop` | POST | — |
+| `/api/v1/actuator/release` | POST | — |
+
+Two things it does on its own, both because a motor driver has no current chopping
+and a actuator standing still with its windings energised is a resistor:
+
+- **It lets go.** After the last step it holds position for 400 ms and then
+  coasts. A station needing indefinite holding torque needs a driver that can
+  limit current, not a longer timeout.
+- **A jog expires.** `jog` is honoured for 400 ms and must be refreshed. If the
+  browser tab closes or the Wi-Fi drops mid-drag, the last thing the firmware
+  heard was "keep going" — and a actuator that keeps going because nobody said
+  stop is how a board drives itself into its end stop.
 
 GPIO3 and GPIO4 are not ESP32-C3 strapping pins. GPIO4 is also a pad-JTAG
 signal at reset; firmware explicitly claims it as GPIO SWDIO while the

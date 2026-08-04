@@ -12,6 +12,9 @@ mod hardware;
 mod spi_wire;
 
 #[cfg(target_os = "espidf")]
+mod actuator_hw;
+
+#[cfg(target_os = "espidf")]
 mod app {
     use std::sync::{Arc, Mutex};
     use std::thread;
@@ -1294,14 +1297,19 @@ mod app {
 
         info!(
             "Pin map: SWDIO=GPIO{} SWCLK=GPIO{} RESET_ALL=GPIO{} ASW_S0=GPIO{} \
-             ASW_S1=GPIO{} DISP_TX=GPIO{} DISP_RX=GPIO{}",
+             ASW_S1=GPIO{} DISP_TX=GPIO{} DISP_RX=GPIO{} \
+             STEP_AIN1=GPIO{} STEP_AIN2=GPIO{} STEP_BIN1=GPIO{} STEP_BIN2=GPIO{}",
             pinmap::PROG_SWDIO,
             pinmap::PROG_SWCLK,
             pinmap::RESET_ALL,
             pinmap::ASW_S0,
             pinmap::ASW_S1,
             pinmap::DISP_TX,
-            pinmap::DISP_RX
+            pinmap::DISP_RX,
+            pinmap::STEP_AIN1,
+            pinmap::STEP_AIN2,
+            pinmap::STEP_BIN1,
+            pinmap::STEP_BIN2
         );
 
         let peripherals = Peripherals::take()?;
@@ -1353,6 +1361,18 @@ mod app {
             SWD_PINS_SWAPPED,
         )?;
 
+        // The board's actuator. Started before the network so the bridges are
+        // driven to coast early: a motor driver leaves its outputs undefined out of
+        // reset, and the window where nothing owns those pins is the window
+        // where the motor can be energised by accident.
+        let actuator = crate::actuator_hw::start(
+            take(pinmap::STEP_AIN1)?,
+            take(pinmap::STEP_AIN2)?,
+            take(pinmap::STEP_BIN1)?,
+            take(pinmap::STEP_BIN2)?,
+        )?;
+        let actuator_planner = actuator.planner();
+
         let wifi_control = Arc::new(Mutex::new(WifiControl::default()));
         let hub = Arc::new(Mutex::new(Hub {
             asw_s0,
@@ -1386,7 +1406,10 @@ mod app {
         spawn_network_bridge(hub.clone())?;
 
         let mut server = EspHttpServer::new(&Default::default())?;
-        register_handlers(&mut server, hub, wifi_control.clone())?;
+        register_handlers(&mut server, hub, wifi_control.clone(), actuator_planner)?;
+        // Dropping `actuator` cancels its timer and the motor stops answering,
+        // so it is held here for as long as the firmware runs.
+        let _actuator = actuator;
 
         // What the radio should be on, read from storage once. Re-reading it
         // every pass reopened the NVS handle twice a second, which is both
@@ -1962,11 +1985,147 @@ mod app {
         }))
     }
 
+    /// The control page page, served from flash.
+    ///
+    /// One file with no external references: the board is reached over its
+    /// own access point, which has no route to a CDN, so a page that pulled a
+    /// framework would render as a blank rectangle exactly when it is needed.
+    const CONTROL_PAGE_PAGE: &str = include_str!("control page.html");
+
+    /// actuator control: status, jog, bounded moves, stop, release.
+    fn register_actuator_handlers(
+        server: &mut EspHttpServer<'static>,
+        actuator: crate::actuator_hw::Shared,
+    ) -> Result<()> {
+        server.fn_handler("/actuator", Method::Get, move |req| {
+            let mut response = req.into_response(
+                200,
+                None,
+                &[("Content-Type", "text/html; charset=utf-8")],
+            )?;
+            response.write_all(CONTROL_PAGE_PAGE.as_bytes())?;
+            Ok::<(), anyhow::Error>(())
+        })?;
+
+        let state = actuator.clone();
+        server.fn_handler("/api/v1/actuator", Method::Get, move |req| {
+            let body = {
+                let planner = state.lock().map_err(|_| anyhow!("actuator lock poisoned"))?;
+                format!(
+                    "{{\"ok\":true,\"position\":{},\"steps_per_s\":{},\"moving\":{},\
+                     \"remaining\":{},\"max_steps_per_s\":{}}}\n",
+                    planner.position(),
+                    planner.rate(),
+                    planner.is_moving(),
+                    match planner.remaining() {
+                        Some(left) => left.to_string(),
+                        None => String::from("null"),
+                    },
+                    esprobe_firmware::actuator::MAX_STEPS_PER_S,
+                )
+            };
+            req.into_ok_response()?.write_all(body.as_bytes())?;
+            Ok::<(), anyhow::Error>(())
+        })?;
+
+        // Every command body is read the same way, so the size limit and the
+        // "is it even text" check live in one place rather than four.
+        fn read_body(req: &mut esp_idf_svc::http::server::Request<&mut esp_idf_svc::http::server::EspHttpConnection<'_>>) -> Result<String> {
+            const MAX: usize = 128;
+            let length = req.content_len().unwrap_or(0) as usize;
+            if length > MAX {
+                return Err(anyhow!("body must be at most {MAX} bytes"));
+            }
+            let mut buffer = vec![0; length];
+            req.read_exact(&mut buffer)?;
+            Ok(String::from_utf8(buffer)?)
+        }
+
+        let state = actuator.clone();
+        server.fn_handler("/api/v1/actuator/jog", Method::Post, move |mut req| {
+            let body = match read_body(&mut req) {
+                Ok(body) => body,
+                Err(error) => {
+                    req.into_status_response(400)?
+                        .write_all(format!("{error}\n").as_bytes())?;
+                    return Ok::<(), anyhow::Error>(());
+                }
+            };
+            let Some(rate) = esprobe_firmware::actuator::json_i32(&body, "steps_per_s") else {
+                req.into_status_response(400)?
+                    .write_all(b"expected {\"steps_per_s\":<integer>}\n")?;
+                return Ok::<(), anyhow::Error>(());
+            };
+            let now = unsafe { esp_idf_svc::sys::esp_timer_get_time() } as u64;
+            let applied = {
+                let mut planner = state.lock().map_err(|_| anyhow!("actuator lock poisoned"))?;
+                planner.jog(rate, now);
+                planner.rate()
+            };
+            req.into_ok_response()?
+                .write_all(format!("{{\"ok\":true,\"steps_per_s\":{applied}}}\n").as_bytes())?;
+            Ok::<(), anyhow::Error>(())
+        })?;
+
+        let state = actuator.clone();
+        server.fn_handler("/api/v1/actuator/move", Method::Post, move |mut req| {
+            let body = match read_body(&mut req) {
+                Ok(body) => body,
+                Err(error) => {
+                    req.into_status_response(400)?
+                        .write_all(format!("{error}\n").as_bytes())?;
+                    return Ok::<(), anyhow::Error>(());
+                }
+            };
+            let Some(steps) = esprobe_firmware::actuator::json_i32(&body, "steps") else {
+                req.into_status_response(400)?
+                    .write_all(b"expected {\"steps\":<integer>,\"steps_per_s\":<integer>}\n")?;
+                return Ok::<(), anyhow::Error>(());
+            };
+            // A move without a rate is a move at a default one, not an error:
+            // the nudge buttons only ever vary the distance.
+            let rate = esprobe_firmware::actuator::json_i32(&body, "steps_per_s").unwrap_or(300);
+            let now = unsafe { esp_idf_svc::sys::esp_timer_get_time() } as u64;
+            {
+                let mut planner = state.lock().map_err(|_| anyhow!("actuator lock poisoned"))?;
+                planner.move_by(steps, rate.max(0) as u32, now);
+            }
+            req.into_ok_response()?
+                .write_all(format!("{{\"ok\":true,\"steps\":{steps}}}\n").as_bytes())?;
+            Ok::<(), anyhow::Error>(())
+        })?;
+
+        for (path, release) in [
+            ("/api/v1/actuator/stop", false),
+            ("/api/v1/actuator/release", true),
+        ] {
+            let state = actuator.clone();
+            server.fn_handler(path, Method::Post, move |req| {
+                let now = unsafe { esp_idf_svc::sys::esp_timer_get_time() } as u64;
+                {
+                    let mut planner =
+                        state.lock().map_err(|_| anyhow!("actuator lock poisoned"))?;
+                    if release {
+                        planner.release(now);
+                    } else {
+                        planner.stop(now);
+                    }
+                }
+                req.into_ok_response()?.write_all(b"{\"ok\":true}\n")?;
+                Ok::<(), anyhow::Error>(())
+            })?;
+        }
+
+        Ok(())
+    }
+
     fn register_handlers(
         server: &mut EspHttpServer<'static>,
         hub: Arc<Mutex<Hub>>,
         wifi: Arc<Mutex<WifiControl>>,
+        actuator: crate::actuator_hw::Shared,
     ) -> Result<()> {
+        register_actuator_handlers(server, actuator)?;
         server.fn_handler("/health", Method::Get, move |req| {
             // Read per request, not captured at start-up. The address is not
             // known when the server is built, and it changes when the probe
