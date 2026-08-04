@@ -95,6 +95,17 @@
   </div>
 
   <div class="card">
+    <div class="row">
+      <button id="selftest">Test pins</button>
+      <button id="buzz">Buzz coils</button>
+    </div>
+    <p id="diag" class="sub" style="margin:10px 0 0">
+      Nothing heard or felt while buzzing means no coil current &mdash; check VM
+      and the shared ground before suspecting anything else.
+    </p>
+  </div>
+
+  <div class="card">
     <dl>
       <dt>link</dt><dd><span class="stat" id="stat"></span><span id="statText">connecting…</span></dd>
       <dt>position</dt><dd id="pos">—</dd>
@@ -209,6 +220,49 @@
   }
   document.getElementById("stop").addEventListener("click", () => post("/api/v1/stepper/stop", {}));
   document.getElementById("release").addEventListener("click", () => post("/api/v1/stepper/release", {}));
+
+  // Bring-up aids. Both answer questions that otherwise need a meter, and both
+  // were needed the first time this board met a motor.
+  const diag = document.getElementById("diag");
+
+  document.getElementById("selftest").addEventListener("click", async () => {
+    diag.textContent = "driving each pin and reading it back\u2026";
+    try {
+      const r = await fetch("/api/v1/stepper/selftest",
+                            {method: "POST", signal: AbortSignal.timeout(4000)});
+      const s = await r.json();
+      const bad = s.pins.filter(p => !p.drove_high || !p.drove_low);
+      diag.textContent = bad.length
+        ? "not driving: " + bad.map(p => p.name + " (gpio " + p.gpio + ")").join(", ")
+        : "all four pins drive and read back. Any fault is past the pin \u2014 "
+          + "wiring, supply, or the driver itself.";
+    } catch { diag.textContent = "the station did not answer the self-test."; }
+  });
+
+  // Reverses both coils twice a second. It cannot rotate more than a step or
+  // two either way, and it is the loudest thing the driver can be made to do,
+  // so a hand on the motor answers "is any current flowing at all".
+  let buzzing = null;
+  const buzzBtn = document.getElementById("buzz");
+  buzzBtn.addEventListener("click", () => {
+    if (buzzing) {
+      clearInterval(buzzing); buzzing = null;
+      buzzBtn.textContent = "Buzz coils";
+      post("/api/v1/stepper/release", {});
+      diag.textContent = "stopped.";
+      return;
+    }
+    let flip = 0;
+    // `seconds` outlives the interval on purpose: if this page dies mid-buzz
+    // the firmware releases the windings on its own rather than holding
+    // current forever.
+    buzzing = setInterval(() => {
+      post("/api/v1/stepper/hold", {state: (flip++ % 2) ? 5 : 1, seconds: 2});
+    }, 400);
+    buzzBtn.textContent = "Stop buzzing";
+    diag.textContent = "buzzing \u2014 put a finger on the motor body.";
+  });
+  window.addEventListener("pagehide", () => { if (buzzing) post("/api/v1/stepper/release", {}); });
 
   async function refresh() {
     try {
