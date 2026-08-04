@@ -165,6 +165,28 @@ pub const HOLD_AFTER_MOTION_US: u64 = 400_000;
 /// this only expires when something stopped talking.
 pub const JOG_TIMEOUT_US: u64 = 400_000;
 
+/// How quickly the step rate is allowed to change, in steps per second per second.
+///
+/// A stepper cannot be commanded to a speed, only accelerated to one. Told to
+/// go from standstill straight to a few hundred steps a second, the rotor
+/// cannot follow the field: it stalls, and a stalled stepper is silent or
+/// buzzes while the driver happily reports everything is fine. That failure
+/// looks exactly like a wiring fault, which is a bad thing for a bench to be
+/// unable to tell apart.
+///
+/// So every rate change is ramped. This value is deliberately gentle — it
+/// reaches the default trackpad speed in about a second, and a motor that can
+/// do better loses nothing but a moment.
+pub const ACCEL_STEPS_PER_S2: i32 = 400;
+
+/// The rate a stepper can start from rest without ramping to it.
+///
+/// A ramp that begins at one step a second has a one-second first interval, so
+/// a short move sits still for a second before its second step — found by a
+/// test asserting a two-step move had finished. Real steppers have a start
+/// speed below which no ramp is needed; this is a conservative one.
+pub const START_STEPS_PER_S: i32 = 50;
+
 /// The fastest we will step, whatever is asked for.
 ///
 /// A stepper commanded past the speed its torque can follow does not go faster,
@@ -202,12 +224,19 @@ pub struct Planner {
     position: i64,
     /// Steps left in a bounded move. `None` while jogging.
     remaining: Option<u32>,
-    /// Signed step rate; zero means not moving.
+    /// The rate being stepped at now, ramped towards `target_rate`.
     rate: i32,
+    /// What was asked for. The rotor has to be brought to it, not thrown at it.
+    target_rate: i32,
+    /// When the ramp was last advanced.
+    ramped_at_us: u64,
     /// When the current command stops being honoured.
     expires_at_us: u64,
-    /// When the next step is due.
-    next_step_us: u64,
+    /// When the last step was taken. The next one is due an interval after it,
+    /// computed from the rate *now* — latching a deadline at step time meant a
+    /// step scheduled while the ramp was slow stayed scheduled that far out,
+    /// however fast the ramp had since become.
+    last_step_us: u64,
     /// When holding position stops and the windings are released.
     release_at_us: u64,
     holding: bool,
@@ -227,8 +256,10 @@ impl Planner {
             position: 0,
             remaining: None,
             rate: 0,
+            target_rate: 0,
+            ramped_at_us: 0,
             expires_at_us: 0,
-            next_step_us: 0,
+            last_step_us: 0,
             release_at_us: 0,
             holding: false,
         }
@@ -239,9 +270,16 @@ impl Planner {
         self.position
     }
 
+    /// The rate being stepped at right now.
     #[must_use]
     pub const fn rate(&self) -> i32 {
         self.rate
+    }
+
+    /// The rate being ramped towards.
+    #[must_use]
+    pub const fn target_rate(&self) -> i32 {
+        self.target_rate
     }
 
     #[must_use]
@@ -291,15 +329,44 @@ impl Planner {
         // next step permanently in the future and the motor would sit still
         // while being told to move.
         if self.rate == 0 {
-            self.next_step_us = now_us;
+            // Behind by one interval, so the first step is taken on the next
+            // poll rather than an interval from now.
+            self.last_step_us = now_us.saturating_sub(1_000_000 / START_STEPS_PER_S as u64);
+            self.ramped_at_us = now_us;
+            // Start at the rate a stepper can leave rest at, or at the target
+            // if that is slower — a slow move should not be ramped down to.
+            self.rate = rate.signum() * rate.abs().min(START_STEPS_PER_S);
         }
-        self.rate = rate;
+        self.target_rate = rate;
         self.holding = true;
     }
 
+    /// Move `rate` towards `target_rate` by whatever the ramp allows.
+    fn ramp(&mut self, now_us: u64) {
+        if self.rate == self.target_rate {
+            self.ramped_at_us = now_us;
+            return;
+        }
+        let elapsed = now_us.saturating_sub(self.ramped_at_us);
+        // Integer division: below this the change rounds to zero and the ramp
+        // would stall, so leave the clock alone and let it accumulate.
+        let change = ((elapsed as i64 * ACCEL_STEPS_PER_S2 as i64) / 1_000_000) as i32;
+        if change == 0 {
+            return;
+        }
+        self.ramped_at_us = now_us;
+        let gap = self.target_rate - self.rate;
+        self.rate += change.min(gap.abs()) * gap.signum();
+    }
+
     /// Stop stepping but keep position, until the hold time runs out.
+    ///
+    /// Immediate, not ramped. Everything that calls this is either a deadline
+    /// that expired or somebody asking it to stop, and neither is a moment to
+    /// keep turning through a deceleration curve.
     pub fn stop(&mut self, now_us: u64) {
         self.rate = 0;
+        self.target_rate = 0;
         self.remaining = None;
         self.expires_at_us = u64::MAX;
         if self.holding {
@@ -340,11 +407,13 @@ impl Planner {
             self.stop(now_us);
         }
 
-        if self.rate != 0 && now_us >= self.next_step_us {
+        self.ramp(now_us);
+
+        if self.rate != 0 && now_us.saturating_sub(self.last_step_us) >= self.interval_us() {
             let forward = self.rate > 0;
             let coils = self.seq.advance(forward);
             self.position += if forward { 1 } else { -1 };
-            self.next_step_us = self.next_step_us.max(now_us).saturating_add(self.interval_us());
+            self.last_step_us = now_us;
 
             if let Some(left) = self.remaining {
                 let left = left - 1;
@@ -497,8 +566,9 @@ mod tests {
         let mut p = Planner::new(StepMode::Full);
         p.move_by(10, 1_000, 0);
         let mut steps = 0;
-        // Poll well past the end; the extra time must not produce extra steps.
-        for t in 0..30_000u64 {
+        // Long enough to cover the ramp as well as the steps; the extra time
+        // must not produce extra steps.
+        for t in 0..2 * SEC {
             if p.poll(t).stepped {
                 steps += 1;
             }
@@ -512,12 +582,12 @@ mod tests {
     fn a_negative_move_goes_the_other_way_and_lands_where_it_started() {
         let mut p = Planner::new(StepMode::Half);
         p.move_by(25, 1_000, 0);
-        for t in 0..40_000u64 {
+        for t in 0..2 * SEC {
             p.poll(t);
         }
         assert_eq!(p.position(), 25);
-        p.move_by(-25, 1_000, 40_000);
-        for t in 40_000..90_000u64 {
+        p.move_by(-25, 1_000, 2 * SEC);
+        for t in 2 * SEC..4 * SEC {
             p.poll(t);
         }
         assert_eq!(p.position(), 0, "it did not come back");
@@ -551,7 +621,9 @@ mod tests {
         // the case that stalled an earlier version, because each refresh
         // pushed the next step further out than the poll that would have taken
         // it.
-        for t in 0..SEC {
+        // Two seconds, so the quarter-second ramp to 100/s is a small part of
+        // it. The point of the test is that refreshing does not *stall* it.
+        for t in 0..2 * SEC {
             if t % 5_000 == 0 {
                 p.jog(100, t);
             }
@@ -560,8 +632,8 @@ mod tests {
             }
         }
         assert!(
-            (95..=105).contains(&steps),
-            "expected about 100 steps in a second at 100/s, got {steps}"
+            (170..=200).contains(&steps),
+            "expected close to 200 steps in two seconds at 100/s, got {steps}"
         );
     }
 
@@ -569,15 +641,26 @@ mod tests {
     fn it_releases_the_windings_after_holding_for_a_while() {
         let mut p = Planner::new(StepMode::Full);
         p.move_by(2, 1_000, 0);
-        for t in 0..5_000u64 {
+        // Find when the move actually ends rather than assuming: with the ramp
+        // starting at 50 steps/s, two steps take about forty milliseconds, and
+        // a fixed wait long enough to be safe was already past the hold.
+        let mut done_at = None;
+        for t in 0..SEC {
             p.poll(t);
+            if !p.is_moving() && done_at.is_none() {
+                done_at = Some(t);
+                break;
+            }
         }
-        assert!(!p.is_moving());
+        let done_at = done_at.expect("the move never finished");
         // Still holding position right after the move.
-        assert!(p.poll(5_000).coils.energised(), "it let go immediately");
+        assert!(
+            p.poll(done_at + 1_000).coils.energised(),
+            "it let go immediately"
+        );
         // And coasting once the hold time is up, because a stepper standing
         // still with its windings on is a resistor.
-        let released = p.poll(5_000 + HOLD_AFTER_MOTION_US + 1);
+        let released = p.poll(done_at + HOLD_AFTER_MOTION_US + 1);
         assert_eq!(released.coils, Coils::RELEASED, "it never let go");
     }
 
@@ -595,14 +678,24 @@ mod tests {
     #[test]
     fn the_rate_is_clamped_rather_than_believed() {
         let mut p = Planner::new(StepMode::Half);
+        // The *requested* rate is what gets clamped; the rate actually being
+        // stepped at is whatever the ramp has reached.
         p.jog(i32::MAX, 0);
-        assert_eq!(p.rate(), MAX_STEPS_PER_S as i32);
+        assert_eq!(p.target_rate(), MAX_STEPS_PER_S as i32);
         p.jog(i32::MIN, 0);
-        assert_eq!(p.rate(), -(MAX_STEPS_PER_S as i32));
-        // And an absurd bounded move is clamped the same way rather than
-        // dividing by something enormous.
+        assert_eq!(p.target_rate(), -(MAX_STEPS_PER_S as i32));
         p.move_by(10, u32::MAX, 0);
-        assert_eq!(p.rate(), MAX_STEPS_PER_S as i32);
+        assert_eq!(p.target_rate(), MAX_STEPS_PER_S as i32);
+        // And the ramp never overshoots what was asked for.
+        p.jog(MAX_STEPS_PER_S as i32, 0);
+        for t in 0..10 * SEC {
+            if t % 100_000 == 0 {
+                p.jog(MAX_STEPS_PER_S as i32, t);
+            }
+            p.poll(t);
+            assert!(p.rate() <= MAX_STEPS_PER_S as i32, "ramped past the cap");
+        }
+        assert_eq!(p.rate(), MAX_STEPS_PER_S as i32, "never reached the cap");
     }
 
     #[test]
@@ -637,6 +730,82 @@ mod tests {
         // so an absurd request is clamped rather than honoured.
         p.hold_state(0, u64::MAX, 0);
         assert_eq!(p.poll(MAX_HOLD_US + 1).coils, Coils::RELEASED);
+    }
+
+    #[test]
+    fn the_rate_is_ramped_rather_than_jumped_to() {
+        let mut p = Planner::new(StepMode::Half);
+        p.jog(800, 0);
+        // Asking for 800 must not produce 800 immediately: the rotor cannot
+        // follow a field that jumps, and a stalled stepper is silent, which
+        // looks exactly like a wiring fault.
+        assert_eq!(
+            p.rate(),
+            START_STEPS_PER_S,
+            "it should leave rest at the start rate, not at the target"
+        );
+        let mut reached = None;
+        for t in 0..5 * SEC {
+            // Refreshed, or the watchdog would stop it a third of the way up
+            // the ramp and the test would be measuring that instead.
+            if t % 100_000 == 0 {
+                p.jog(800, t);
+            }
+            p.poll(t);
+            if p.rate() == 800 && reached.is_none() {
+                reached = Some(t);
+            }
+        }
+        let at = reached.expect("never reached the requested rate");
+        // 800 steps/s at 400 steps/s^2 is about two seconds.
+        assert!(
+            (1_500_000..2_500_000).contains(&at),
+            "reached full rate at {at}us, which is not the ramp we asked for"
+        );
+    }
+
+    #[test]
+    fn stopping_is_immediate_and_not_ramped_down() {
+        let mut p = Planner::new(StepMode::Half);
+        p.jog(600, 0);
+        for t in 0..2 * SEC {
+            if t % 100_000 == 0 {
+                p.jog(600, t);
+            }
+            p.poll(t);
+        }
+        assert!(p.rate() > 0);
+        // Everything that stops is either a deadline that expired or somebody
+        // asking, and neither is a moment to keep turning through a curve.
+        p.stop(2 * SEC);
+        assert_eq!(p.rate(), 0);
+        assert_eq!(p.target_rate(), 0);
+        assert!(!p.poll(2 * SEC + 1).stepped);
+    }
+
+    #[test]
+    fn reversing_passes_through_zero_instead_of_flipping() {
+        let mut p = Planner::new(StepMode::Half);
+        p.jog(400, 0);
+        for t in 0..2 * SEC {
+            if t % 100_000 == 0 {
+                p.jog(400, t);
+            }
+            p.poll(t);
+        }
+        assert!(p.rate() > 0);
+        let mut seen_slow = false;
+        for t in 2 * SEC..5 * SEC {
+            if t % 100_000 == 0 {
+                p.jog(-400, t);
+            }
+            p.poll(t);
+            if p.rate().abs() < 40 {
+                seen_slow = true;
+            }
+        }
+        assert!(seen_slow, "the rate flipped sign without slowing down");
+        assert_eq!(p.rate(), -400, "it did not reach the reversed rate");
     }
 
     #[test]
