@@ -2009,16 +2009,15 @@ mod app {
                 req.into_response(304, None, &[("ETag", etag.as_str())])?;
                 return Ok::<(), anyhow::Error>(());
             }
-            // Content-Length rather than chunked: the length is known at build
-            // time, and a browser that knows it can render as the body lands
-            // instead of waiting for the terminating chunk.
-            let length = esprobe_firmware::control page::PAGE.len().to_string();
+            // No Content-Length here. It was set once and the server ignored
+            // it: esp-idf's httpd frames the body itself and sends this
+            // chunked, so the header was a claim the response did not honour.
+            // The caching above is what actually saves the transfer.
             let mut response = req.into_response(
                 200,
                 None,
                 &[
                     ("Content-Type", "text/html; charset=utf-8"),
-                    ("Content-Length", length.as_str()),
                     ("ETag", etag.as_str()),
                     ("Cache-Control", "public, max-age=60, must-revalidate"),
                 ],
