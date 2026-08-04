@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>Stepper station</title>
+<style>
+  :root{
+    --bg:#101216; --panel:#191d24; --line:#2b313b; --ink:#e6e9ee;
+    --dim:#8b94a3; --accent:#4da3ff; --warn:#ff8a5b; --ok:#54d18c;
+  }
+  @media (prefers-color-scheme: light){
+    :root{ --bg:#f4f6f9; --panel:#fff; --line:#dbe1ea; --ink:#131720;
+           --dim:#5d6675; --accent:#0b64d0; }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:15px/1.45 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
+       -webkit-text-size-adjust:100%}
+  main{max-width:640px;margin:0 auto;padding:16px 16px 32px}
+  h1{font-size:17px;margin:4px 0 2px;letter-spacing:.2px}
+  .sub{color:var(--dim);font-size:13px;margin:0 0 14px}
+  .card{background:var(--panel);border:1px solid var(--line);
+        border-radius:14px;padding:14px;margin-bottom:12px}
+
+  /* The pad. Fixed aspect so a phone in either orientation gets the same feel. */
+  #pad{position:relative;width:100%;aspect-ratio:3/2;border-radius:14px;
+       border:1px solid var(--line);background:
+         radial-gradient(circle at 50% 50%, rgba(77,163,255,.10), transparent 60%),
+         var(--panel);
+       touch-action:none;overflow:hidden;user-select:none;-webkit-user-select:none;
+       cursor:grab}
+  #pad.live{cursor:grabbing;border-color:var(--accent)}
+  #centre{position:absolute;left:50%;top:0;bottom:0;width:1px;
+          background:var(--line)}
+  #dead{position:absolute;left:50%;top:0;bottom:0;width:14%;
+        transform:translateX(-50%);background:rgba(139,148,163,.10)}
+  #knob{position:absolute;top:50%;left:50%;width:56px;height:56px;
+        margin:-28px 0 0 -28px;border-radius:50%;
+        background:var(--accent);opacity:.9;
+        box-shadow:0 6px 18px rgba(0,0,0,.35);
+        transition:transform .08s ease-out}
+  #padhint{position:absolute;left:0;right:0;bottom:8px;text-align:center;
+           color:var(--dim);font-size:12px;pointer-events:none}
+
+  .row{display:flex;gap:8px;flex-wrap:wrap}
+  button{flex:1 1 auto;min-width:64px;padding:11px 8px;border-radius:10px;
+         border:1px solid var(--line);background:transparent;color:var(--ink);
+         font:inherit;font-variant-numeric:tabular-nums;cursor:pointer}
+  button:active{background:rgba(127,127,127,.16)}
+  button.stop{border-color:var(--warn);color:var(--warn);font-weight:600}
+  button.rel{border-color:var(--dim);color:var(--dim)}
+
+  dl{display:grid;grid-template-columns:auto 1fr;gap:4px 14px;margin:0}
+  dt{color:var(--dim);font-size:13px}
+  dd{margin:0;font-variant-numeric:tabular-nums}
+  .stat{display:inline-block;width:8px;height:8px;border-radius:50%;
+        background:var(--dim);margin-right:6px;vertical-align:middle}
+  .stat.on{background:var(--ok)}
+  .stat.err{background:var(--warn)}
+  label{display:flex;align-items:center;gap:10px;color:var(--dim);font-size:13px}
+  input[type=range]{flex:1}
+</style>
+</head>
+<body>
+<main>
+  <h1>Stepper station</h1>
+  <p class="sub">Drag the pad left or right to jog. Let go to stop.</p>
+
+  <div class="card">
+    <div id="pad">
+      <div id="dead"></div><div id="centre"></div><div id="knob"></div>
+      <div id="padhint">drag &larr; reverse &nbsp;·&nbsp; forward &rarr;</div>
+    </div>
+    <label style="margin-top:12px">
+      top speed
+      <input id="cap" type="range" min="20" max="1000" step="10" value="400">
+      <span id="capval" style="width:5.5em;text-align:right">400/s</span>
+    </label>
+  </div>
+
+  <div class="card">
+    <div class="row" style="margin-bottom:8px">
+      <button data-step="-100">−100</button>
+      <button data-step="-10">−10</button>
+      <button data-step="-1">−1</button>
+      <button data-step="1">+1</button>
+      <button data-step="10">+10</button>
+      <button data-step="100">+100</button>
+    </div>
+    <div class="row">
+      <button class="stop" id="stop">Stop</button>
+      <button class="rel" id="release">Release</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <dl>
+      <dt>link</dt><dd><span class="stat" id="stat"></span><span id="statText">connecting…</span></dd>
+      <dt>position</dt><dd id="pos">—</dd>
+      <dt>rate</dt><dd id="rate">—</dd>
+      <dt>remaining</dt><dd id="rem">—</dd>
+    </dl>
+  </div>
+</main>
+
+<script>
+(() => {
+  "use strict";
+  const pad = document.getElementById("pad");
+  const knob = document.getElementById("knob");
+  const capEl = document.getElementById("cap");
+  const capVal = document.getElementById("capval");
+  const statDot = document.getElementById("stat");
+  const statText = document.getElementById("statText");
+
+  // Anything past this fraction of half-width is full speed; anything inside
+  // the dead zone is a stop. Without a dead zone a finger resting a couple of
+  // pixels off centre creeps the motor, which looks like a fault.
+  const DEAD = 0.07, FULL = 0.92;
+  let cap = Number(capEl.value);
+  let jogging = false, sent = 0, pointer = null;
+
+  capEl.addEventListener("input", () => {
+    cap = Number(capEl.value);
+    capVal.textContent = cap + "/s";
+  });
+
+  async function post(path, body) {
+    try {
+      const r = await fetch(path, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(body || {}),
+        // Keep it short: a request still in flight when the finger lifts must
+        // not outlive the stop that follows it.
+        signal: AbortSignal.timeout(1500),
+      });
+      return r.ok;
+    } catch { return false; }
+  }
+
+  function rateFor(x) {
+    const half = pad.clientWidth / 2;
+    let f = (x - half) / half;                 // -1 .. 1
+    const sign = Math.sign(f);
+    f = Math.abs(f);
+    if (f < DEAD) return 0;
+    f = Math.min(1, (f - DEAD) / (FULL - DEAD));
+    // Squared, so the first half of the travel is fine control and the far
+    // edge is full speed. Linear made everything past a third of the pad feel
+    // the same.
+    return Math.round(sign * f * f * cap);
+  }
+
+  function drawKnob(x) {
+    const half = pad.clientWidth / 2;
+    knob.style.transform = "translateX(" + (x - half) + "px)";
+  }
+
+  // The firmware stops on its own if it stops hearing from us, so this only
+  // has to be more often than that deadline — not fast.
+  const REFRESH_MS = 120;
+  let timer = null;
+
+  function begin(e) {
+    pointer = e.pointerId;
+    pad.setPointerCapture(pointer);
+    pad.classList.add("live");
+    jogging = true;
+    move(e);
+    if (!timer) timer = setInterval(() => { if (jogging) post("/api/v1/stepper/jog", {steps_per_s: sent}); }, REFRESH_MS);
+  }
+
+  function move(e) {
+    if (!jogging) return;
+    const x = e.clientX - pad.getBoundingClientRect().left;
+    drawKnob(Math.max(0, Math.min(pad.clientWidth, x)));
+    const r = rateFor(x);
+    if (r !== sent) { sent = r; post("/api/v1/stepper/jog", {steps_per_s: r}); }
+  }
+
+  function end() {
+    if (!jogging) return;
+    jogging = false; sent = 0;
+    pad.classList.remove("live");
+    knob.style.transform = "translateX(0px)";
+    if (timer) { clearInterval(timer); timer = null; }
+    // Sent twice on purpose. This is the one message that must not be lost,
+    // and it is the one most likely to be, because it is sent at the moment a
+    // finger leaves a screen that may be about to sleep.
+    post("/api/v1/stepper/jog", {steps_per_s: 0});
+    setTimeout(() => post("/api/v1/stepper/stop", {}), 60);
+  }
+
+  pad.addEventListener("pointerdown", begin);
+  pad.addEventListener("pointermove", move);
+  for (const ev of ["pointerup", "pointercancel", "pointerleave"]) {
+    pad.addEventListener(ev, end);
+  }
+  // A tab going to the background stops getting timers, so stop deliberately
+  // rather than leaving it to the firmware's watchdog.
+  document.addEventListener("visibilitychange", () => { if (document.hidden) end(); });
+  window.addEventListener("blur", end);
+
+  for (const b of document.querySelectorAll("button[data-step]")) {
+    b.addEventListener("click", () =>
+      post("/api/v1/stepper/move", {steps: Number(b.dataset.step), steps_per_s: cap}));
+  }
+  document.getElementById("stop").addEventListener("click", () => post("/api/v1/stepper/stop", {}));
+  document.getElementById("release").addEventListener("click", () => post("/api/v1/stepper/release", {}));
+
+  async function refresh() {
+    try {
+      const r = await fetch("/api/v1/stepper", {signal: AbortSignal.timeout(1500)});
+      const s = await r.json();
+      statDot.className = "stat on"; statText.textContent = "online";
+      document.getElementById("pos").textContent = s.position;
+      document.getElementById("rate").textContent = s.steps_per_s + " steps/s";
+      document.getElementById("rem").textContent = s.remaining === null ? "—" : s.remaining;
+      if (Number(capEl.max) !== s.max_steps_per_s) {
+        capEl.max = s.max_steps_per_s;
+        if (cap > s.max_steps_per_s) { capEl.value = s.max_steps_per_s; capEl.dispatchEvent(new Event("input")); }
+      }
+    } catch {
+      statDot.className = "stat err"; statText.textContent = "no answer";
+    }
+  }
+  refresh(); setInterval(refresh, 500);
+})();
+</script>
+</body>
+</html>
