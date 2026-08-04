@@ -49,9 +49,11 @@ pub mod control page {
     pub const MOVE: &str = "/api/v1/actuator/move";
     pub const STOP: &str = "/api/v1/actuator/stop";
     pub const RELEASE: &str = "/api/v1/actuator/release";
+    /// Hold one excitation state so the bridges can be measured.
+    pub const HOLD: &str = "/api/v1/actuator/hold";
 
     /// Every route the firmware answers on, for the page to be checked against.
-    pub const ROUTES: [&str; 5] = [STATUS, JOG, MOVE, STOP, RELEASE];
+    pub const ROUTES: [&str; 6] = [STATUS, JOG, MOVE, STOP, RELEASE, HOLD];
 
     #[cfg(test)]
     mod tests {

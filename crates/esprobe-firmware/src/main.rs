@@ -2114,6 +2114,46 @@ mod app {
             Ok::<(), anyhow::Error>(())
         })?;
 
+        let state = actuator.clone();
+        server.fn_handler(
+            esprobe_firmware::control page::HOLD,
+            Method::Post,
+            move |mut req| {
+                let body = match read_body(&mut req) {
+                    Ok(body) => body,
+                    Err(error) => {
+                        req.into_status_response(400)?
+                            .write_all(format!("{error}\n").as_bytes())?;
+                        return Ok::<(), anyhow::Error>(());
+                    }
+                };
+                // A bench aid, not part of driving a motor: it holds one
+                // excitation state so a meter can be put across AOUT/BOUT and
+                // answer whether the driver responds to its inputs at all.
+                let state_index = esprobe_firmware::actuator::json_i32(&body, "state").unwrap_or(0);
+                let seconds = esprobe_firmware::actuator::json_i32(&body, "seconds").unwrap_or(3);
+                if !(0..=7).contains(&state_index) || seconds <= 0 {
+                    req.into_status_response(400)?.write_all(
+                        b"expected {\"state\":0..=7,\"seconds\":<positive integer>}\n",
+                    )?;
+                    return Ok::<(), anyhow::Error>(());
+                }
+                let hold_us = (seconds as u64).saturating_mul(1_000_000);
+                let now = unsafe { esp_idf_svc::sys::esp_timer_get_time() } as u64;
+                {
+                    let mut planner =
+                        state.lock().map_err(|_| anyhow!("actuator lock poisoned"))?;
+                    planner.hold_state(state_index as u8, hold_us, now);
+                }
+                let capped = hold_us.min(esprobe_firmware::actuator::MAX_HOLD_US) / 1_000_000;
+                req.into_ok_response()?.write_all(
+                    format!("{{\"ok\":true,\"state\":{state_index},\"seconds\":{capped}}}\n")
+                        .as_bytes(),
+                )?;
+                Ok::<(), anyhow::Error>(())
+            },
+        )?;
+
         for (path, release) in [
             (esprobe_firmware::control page::STOP, false),
             (esprobe_firmware::control page::RELEASE, true),
