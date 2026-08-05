@@ -183,7 +183,15 @@ pub const JOG_TIMEOUT_US: u64 = 400_000;
 /// which the firmware can see. [`Planner::set_accel`] tunes it at runtime so
 /// finding the value just short of stalling costs a slider drag rather than a
 /// reflash.
-pub const ACCEL_STEPS_PER_S2: i32 = 4_000;
+///
+/// It defaults to the ceiling, which is the fastest response available and
+/// **not** the safest setting. At this rate the ramp is effectively a step
+/// change, and a motor asked for more than its torque can follow does not go
+/// faster — it slips, silently, while the position count carries on believing
+/// itself. That is a deliberate choice of responsiveness over accuracy for a
+/// hand-driven bench station; anything that cares where the shaft actually is
+/// should turn this down until it stops slipping.
+pub const ACCEL_STEPS_PER_S2: i32 = MAX_ACCEL_STEPS_PER_S2;
 
 /// How hard the rate is brought *down*.
 ///
@@ -204,6 +212,9 @@ pub const DECEL_STEPS_PER_S2: i32 = 20_000;
 /// change and asking for more is asking for nothing.
 pub const MIN_ACCEL_STEPS_PER_S2: i32 = 100;
 /// See [`MIN_ACCEL_STEPS_PER_S2`].
+///
+/// At the maximum step rate this covers the entire range in a single poll, so
+/// the ramp has become a step change and asking for more changes nothing.
 pub const MAX_ACCEL_STEPS_PER_S2: i32 = 200_000;
 
 /// The rate a stepper can start from rest without ramping to it.
@@ -270,6 +281,8 @@ pub struct Planner {
     /// How hard to accelerate, in steps per second squared. Tunable because the
     /// right value is a property of the machine, not of this code.
     accel: i32,
+    /// The highest command sequence applied so far. See [`Planner::accept`].
+    last_seq: i64,
 }
 
 impl Default for Planner {
@@ -293,6 +306,42 @@ impl Planner {
             release_at_us: 0,
             holding: false,
             accel: ACCEL_STEPS_PER_S2,
+            last_seq: i64::MIN,
+        }
+    }
+
+    /// Should a motion command carrying this sequence number be obeyed?
+    ///
+    /// The pad posts a jog every time the rate changes, and those requests can
+    /// overtake each other on a wireless link. The case that matters is a jog
+    /// still in flight when the finger lifts: it lands *after* the stop and
+    /// starts the motor again, for as long as the jog watchdog allows. To
+    /// anyone holding the pad that is a motor which ignored being released.
+    ///
+    /// So motion carries a sequence and stale motion is dropped. Commands with
+    /// no sequence are always obeyed — `curl` and the CLI have no session to
+    /// order, and refusing them would be refusing the bench its own tools.
+    ///
+    /// Stopping deliberately does **not** go through here. A stop that arrives
+    /// out of order must still stop; there is no reading of a dropped stop that
+    /// leaves a motor safer.
+    pub fn accept(&mut self, seq: Option<i64>) -> bool {
+        match seq {
+            None => true,
+            Some(seq) if seq > self.last_seq => {
+                self.last_seq = seq;
+                true
+            }
+            Some(_) => false,
+        }
+    }
+
+    /// Record a sequence without gating on it, for commands that always run.
+    pub const fn observe(&mut self, seq: Option<i64>) {
+        if let Some(seq) = seq
+            && seq > self.last_seq
+        {
+            self.last_seq = seq;
         }
     }
 
@@ -521,6 +570,16 @@ impl Planner {
 /// the caller answers 400.
 #[must_use]
 pub fn json_i32(body: &str, field: &str) -> Option<i32> {
+    // Out-of-range is `None`, not a wrapped value: a rate that arrived too large
+    // to represent is a bug at the sender, and honouring some truncation of it
+    // would move a motor by an amount nobody asked for.
+    json_i64(body, field).and_then(|v| i32::try_from(v).ok())
+}
+
+/// The same, for values that do not fit in 32 bits — command sequence numbers
+/// are millisecond timestamps, which passed `i32` in 1970.
+#[must_use]
+pub fn json_i64(body: &str, field: &str) -> Option<i64> {
     let mut search = 0;
     // The field must appear as a quoted key, so a value that happens to spell
     // another field's name cannot be mistaken for one.
@@ -544,8 +603,7 @@ pub fn json_i32(body: &str, field: &str) -> Option<i32> {
             return None;
         }
         let magnitude: i64 = digits[..end].parse().ok()?;
-        let signed = if negative { -magnitude } else { magnitude };
-        return i32::try_from(signed).ok();
+        return Some(if negative { -magnitude } else { magnitude });
     }
     None
 }
@@ -836,6 +894,10 @@ mod tests {
         // Braking cannot make a motor slip the way accelerating can, so it is
         // not held to the same rate.
         let mut p = Planner::new(StepMode::Half);
+        // Explicitly gentle. The shipping default is the ceiling, where the ramp
+        // is a step change in both directions and this comparison would pass on
+        // two zeroes without testing anything.
+        p.set_accel(1_000);
         let mut up = None;
         for t in 0..5 * SEC {
             if t % 100_000 == 0 {
@@ -897,6 +959,78 @@ mod tests {
             crossed < 150_000,
             "took {crossed}us just to stop going forwards after a full reversal"
         );
+    }
+
+    #[test]
+    fn a_stale_jog_cannot_outlive_the_stop_that_followed_it() {
+        // The pad posts a jog per rate change; on a wireless link one can still
+        // be in flight when the finger lifts and land after the stop. Without
+        // ordering the motor restarts and runs until the jog watchdog expires,
+        // which to whoever let go is a motor that ignored them.
+        let mut p = Planner::new(StepMode::Half);
+        assert!(p.accept(Some(10)));
+        p.jog(600, 0);
+        // Inside the jog watchdog: polling past it would stop the motor for a
+        // reason that has nothing to do with what is being tested.
+        let lifted = JOG_TIMEOUT_US / 2;
+        for t in 0..lifted {
+            p.poll(t);
+        }
+        assert!(p.is_moving());
+
+        // The stop is not gated, but it records its place in the sequence.
+        p.observe(Some(11));
+        p.stop(lifted);
+        assert!(!p.is_moving());
+
+        // The overtaken jog now arrives.
+        assert!(
+            !p.accept(Some(10)),
+            "a jog older than the stop was accepted"
+        );
+        for t in lifted..lifted + JOG_TIMEOUT_US / 2 {
+            p.poll(t);
+        }
+        assert!(!p.is_moving(), "a stale jog restarted a stopped motor");
+    }
+
+    #[test]
+    fn a_stop_is_obeyed_even_when_it_arrives_out_of_order() {
+        // There is no reading of a dropped stop that leaves a motor safer, so
+        // stopping never goes through the sequence gate.
+        let mut p = Planner::new(StepMode::Half);
+        assert!(p.accept(Some(100)));
+        p.jog(600, 0);
+        let lifted = JOG_TIMEOUT_US / 2;
+        for t in 0..lifted {
+            p.poll(t);
+        }
+        assert!(p.is_moving());
+        p.observe(Some(5));
+        p.stop(lifted);
+        assert!(!p.is_moving(), "an out-of-order stop was ignored");
+    }
+
+    #[test]
+    fn commands_without_a_sequence_are_always_obeyed() {
+        // curl and the CLI have no session to order.
+        let mut p = Planner::new(StepMode::Half);
+        assert!(p.accept(Some(1_000)));
+        assert!(p.accept(None), "an unsequenced command was refused");
+        assert!(p.accept(None));
+        // ...and they must not raise the bar for the page that does sequence.
+        assert!(p.accept(Some(1_001)), "an unsequenced command moved the sequence");
+    }
+
+    #[test]
+    fn a_sequence_number_larger_than_a_32_bit_value_survives() {
+        // They are millisecond timestamps, so they left i32 behind in 1970 and
+        // a narrowing parse would make every one of them collide.
+        let body = r#"{"steps_per_s":120,"seq":1785000000000}"#;
+        assert_eq!(json_i64(body, "seq"), Some(1_785_000_000_000));
+        assert_eq!(json_i32(body, "steps_per_s"), Some(120));
+        // Too large for i32 is None rather than a truncation nobody asked for.
+        assert_eq!(json_i32(body, "seq"), None);
     }
 
     #[test]
