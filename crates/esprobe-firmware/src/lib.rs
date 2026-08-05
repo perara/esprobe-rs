@@ -181,8 +181,17 @@ pub mod pinmap {
     // the two. `esprobe pin-map` asks the board what it is really using, and
     // it answered with this — so this is now what the source says as well.
     // A v1.0 board still builds, by passing the old numbers as overrides.
-    pub const DISP_TX: i32 = pin(option_env!("PIN_DISP_TX"), 4);
-    pub const DISP_RX: i32 = pin(option_env!("PIN_DISP_RX"), 3);
+    // Swapped 2026-08-06 after direction-finding on the real harness: a break
+    // driven from the STM32's PA10 side arrived at this chip's receiver, and
+    // real UART bytes out of the STM32's PA9 (transmit-complete confirmed in
+    // its status register) did not. So GPIO3 is the wire toward the STM32's
+    // RX - our TX - and GPIO4 the wire from the STM32's TX - our RX. The old
+    // assignment was exactly inverted: two transmitters fighting one wire,
+    // two receivers listening to each other on the other, zero bytes ever
+    // crossing, and register watches on both ends showing nothing but "alive
+    // and silent" for a whole day.
+    pub const DISP_TX: i32 = pin(option_env!("PIN_DISP_TX"), 3);
+    pub const DISP_RX: i32 = pin(option_env!("PIN_DISP_RX"), 4);
     pub const RESET_ALL: i32 = pin(option_env!("PIN_RESET_ALL"), 21);
     pub const PROG_SWDIO: i32 = pin(option_env!("PIN_SWDIO"), 1);
     pub const PROG_SWCLK: i32 = pin(option_env!("PIN_SWCLK"), 2);
