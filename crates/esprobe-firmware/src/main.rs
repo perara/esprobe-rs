@@ -150,6 +150,25 @@ mod app {
             Ok(())
         }
 
+        /// Route UART1's transmitter onto `DISP_TX` and enable the driver.
+        ///
+        /// Idempotent, and cheap enough to call before every write. Nothing
+        /// ever releases this pad now - see the constructor for why the old
+        /// release-and-redrive dance silently stopped the port transmitting.
+        fn bind_disp_tx() -> Result<()> {
+            // SAFETY: the pin belongs to this driver and the port is open.
+            esp_idf_svc::sys::esp!(unsafe {
+                uart_set_pin(
+                    uart_port_t_UART_NUM_1,
+                    pinmap::DISP_TX,
+                    UART_PIN_NO_CHANGE,
+                    UART_PIN_NO_CHANGE,
+                    UART_PIN_NO_CHANGE,
+                )
+            })?;
+            Ok(())
+        }
+
         fn reclaim_gpio(pin: i32) -> Result<()> {
             // SAFETY: these are valid ESP32-C3 GPIO numbers owned by Hub.
             // gpio_reset_pin selects the GPIO IO-mux function; changing only
@@ -261,13 +280,13 @@ mod app {
 
         fn write_display(&mut self, frame: &[u8]) -> Result<usize> {
             self.require_target_power()?;
-            Self::set_gpio_direction(pinmap::DISP_TX, gpio_mode_t_GPIO_MODE_OUTPUT)?;
+            Self::bind_disp_tx()?;
             let result = (|| {
                 let written = self.display.write(frame)?;
                 self.display.wait_tx_done(100)?;
                 Ok(written)
             })();
-            Self::set_gpio_direction(pinmap::DISP_TX, gpio_mode_t_GPIO_MODE_INPUT)?;
+            // DISP_TX stays bound; see the constructor.
             result
         }
 
@@ -509,16 +528,14 @@ mod app {
                         .change_parity(Parity::ParityNone)
                         .map_err(|_| SwdError::Protocol(0))?;
                     self.display.clear_rx().map_err(|_| SwdError::Protocol(0))?;
-                    Self::set_gpio_direction(pinmap::DISP_TX, gpio_mode_t_GPIO_MODE_OUTPUT)
-                        .map_err(|_| SwdError::Protocol(0))?;
+                    Self::bind_disp_tx().map_err(|_| SwdError::Protocol(0))?;
                     self.display
                         .write(&ENTER_ROM_BOOT_FRAME)
                         .map_err(|_| SwdError::Protocol(0))?;
                     self.display
                         .wait_tx_done(100)
                         .map_err(|_| SwdError::Protocol(0))?;
-                    Self::set_gpio_direction(pinmap::DISP_TX, gpio_mode_t_GPIO_MODE_INPUT)
-                        .map_err(|_| SwdError::Protocol(0))?;
+                    // DISP_TX stays bound; see the constructor.
                     let mut length = self.display.read(response, 100).unwrap_or(0);
                     if length == 0 {
                         // Older application firmware may not implement the
@@ -546,20 +563,18 @@ mod app {
                         .map_err(|_| SwdError::Protocol(0))?;
                     let rom_sync = (|| {
                         self.display.clear_rx().map_err(|_| SwdError::Protocol(0))?;
-                        Self::set_gpio_direction(pinmap::DISP_TX, gpio_mode_t_GPIO_MODE_OUTPUT)
-                            .map_err(|_| SwdError::Protocol(0))?;
+                        Self::bind_disp_tx().map_err(|_| SwdError::Protocol(0))?;
                         self.display
                             .write(&[0x7f])
                             .map_err(|_| SwdError::Protocol(0))?;
                         self.display
                             .wait_tx_done(100)
                             .map_err(|_| SwdError::Protocol(0))?;
-                        Self::set_gpio_direction(pinmap::DISP_TX, gpio_mode_t_GPIO_MODE_INPUT)
-                            .map_err(|_| SwdError::Protocol(0))?;
+                        // DISP_TX stays bound; see the constructor.
                         Ok(self.display.read(&mut response[length..], 100).unwrap_or(0))
                     })();
                     // Restore the shared display UART even if ROM sync failed.
-                    let _ = Self::set_gpio_direction(pinmap::DISP_TX, gpio_mode_t_GPIO_MODE_INPUT);
+                    // DISP_TX stays bound; see the constructor.
                     let parity_restore = self
                         .display
                         .change_parity(Parity::ParityNone)
@@ -576,16 +591,14 @@ mod app {
                         .change_parity(Parity::ParityNone)
                         .map_err(|_| SwdError::Protocol(0))?;
                     self.display.clear_rx().map_err(|_| SwdError::Protocol(0))?;
-                    Self::set_gpio_direction(pinmap::DISP_TX, gpio_mode_t_GPIO_MODE_OUTPUT)
-                        .map_err(|_| SwdError::Protocol(0))?;
+                    Self::bind_disp_tx().map_err(|_| SwdError::Protocol(0))?;
                     let written = self.display.write(payload);
                     let drained = self.display.wait_tx_done(200);
                     // Release the line whatever happened above: leaving the
                     // bridge driving DISP_TX would fight the STM32's own
                     // transmitter, which is the contention this pin map exists
                     // to avoid.
-                    Self::set_gpio_direction(pinmap::DISP_TX, gpio_mode_t_GPIO_MODE_INPUT)
-                        .map_err(|_| SwdError::Protocol(0))?;
+                    // DISP_TX stays bound; see the constructor.
                     written.map_err(|_| SwdError::Protocol(0))?;
                     drained.map_err(|_| SwdError::Protocol(0))?;
                     // Ten bytes are reserved by the bridge envelope.
@@ -613,8 +626,7 @@ mod app {
                     // only thing holding traffic that arrived between calls,
                     // and discarding it made a passive tap miss everything it
                     // was not lucky enough to be inside the window for.
-                    Self::set_gpio_direction(pinmap::DISP_TX, gpio_mode_t_GPIO_MODE_INPUT)
-                        .map_err(|_| SwdError::Protocol(0))?;
+                    // DISP_TX stays bound; see the constructor.
                     // Ten bytes are reserved by the bridge envelope.
                     let capacity = response.len().min(BRIDGE_MAX_FRAME - 10);
                     // `read` returns as soon as it has any byte at all, so a
@@ -667,8 +679,7 @@ mod app {
                             .change_parity(Parity::ParityNone)
                             .map_err(|_| SwdError::Protocol(0))?;
                         self.display.clear_rx().map_err(|_| SwdError::Protocol(0))?;
-                        Self::set_gpio_direction(pinmap::DISP_TX, gpio_mode_t_GPIO_MODE_INPUT)
-                            .map_err(|_| SwdError::Protocol(0))?;
+                        // DISP_TX stays bound; see the constructor.
                         self.pulse_reset_all_low_release()
                             .map_err(|_| SwdError::Protocol(0))?;
                         let capacity = response.len().min(BRIDGE_MAX_FRAME - 10);
@@ -1361,9 +1372,21 @@ mod app {
             Option::<esp_idf_svc::hal::gpio::AnyIOPin>::None,
             &UartConfig::new().baudrate(Hertz(115_200)),
         )?;
-        // Likewise: 5 was `DISP_TX` on the v1.0 board and is the stepper's
-        // `BIN2` on revision 2.
-        Hub::set_gpio_direction(pinmap::DISP_TX, gpio_mode_t_GPIO_MODE_INPUT)?;
+        // DISP_TX stays bound to UART1 for the life of the firmware.
+        //
+        // It used to be released to an input here and re-driven around every
+        // write, which was right when this pin was believed to sit on the
+        // STM32's *transmit* line - two transmitters on one wire is real
+        // contention. Direction-finding on the harness showed otherwise:
+        // DISP_TX lands on the STM32's PA10, which is its UART *receive*
+        // input and drives nothing. There is nothing to contend with, and the
+        // release was not free - ESP-IDF's `gpio_set_direction(_, INPUT)`
+        // calls `gpio_output_disable`, which rewrites the pad's
+        // `func_out_sel` to `SIG_GPIO_OUT_IDX` to guarantee no peripheral is
+        // routed there. Re-enabling the output afterwards restores the driver
+        // but not the routing, so the pad drove a constant level - idle high,
+        // indistinguishable from a healthy idle line - and not one byte ever
+        // left. The far end saw a quiet, error-free, permanently empty wire.
         let swd = EspSwdIo::new(
             take(pinmap::PROG_SWDIO)?,
             take(pinmap::PROG_SWCLK)?,
