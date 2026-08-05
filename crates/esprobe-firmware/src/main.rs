@@ -13,6 +13,7 @@ mod spi_wire;
 
 #[cfg(target_os = "espidf")]
 mod stepper_hw;
+mod ws_link;
 
 #[cfg(target_os = "espidf")]
 mod app {
@@ -1419,7 +1420,12 @@ mod app {
         // buffer this chip pays for whether or not anything connects.
         let mut server = EspHttpServer::new(&esp_idf_svc::http::server::Configuration {
             stack_size: 8192,
-            max_open_sockets: 4,
+            // A websocket holds its socket for as long as the page is open,
+            // so this is now a count of simultaneous *users* plus whatever
+            // REST traffic overlaps them — not a count of requests in flight.
+            // At four, three stale tabs left the station unreachable on every
+            // route including its own health check.
+            max_open_sockets: 8,
             max_uri_handlers: 24,
             lru_purge_enable: true,
             ..Default::default()
@@ -1932,6 +1938,13 @@ mod app {
         );
         match wifi.connect().and_then(|()| wifi.wait_netif_up()) {
             Ok(()) => {
+                // Re-asserted after every join, not only at start-up. The
+                // driver restores its default power-save mode across a stop or
+                // a restart, and this path can reach `wifi.start()` above, so a
+                // probe that reconnected once would quietly go back to parking
+                // its radio between beacons — and pay for it on every command
+                // for the rest of the session.
+                disable_power_save();
                 // Re-applied after association: setting it once at start-up
                 // did not survive `connect`, and the round trip stayed at
                 // 130 ms against a gateway 0.3 ms away.
@@ -2315,7 +2328,8 @@ mod app {
         wifi: Arc<Mutex<WifiControl>>,
         stepper: crate::stepper_hw::Shared,
     ) -> Result<()> {
-        register_stepper_handlers(server, stepper)?;
+        register_stepper_handlers(server, stepper.clone())?;
+        crate::ws_link::register(server, stepper)?;
         server.fn_handler("/health", Method::Get, move |req| {
             // Read per request, not captured at start-up. The address is not
             // known when the server is built, and it changes when the probe

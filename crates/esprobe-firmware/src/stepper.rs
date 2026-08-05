@@ -237,6 +237,14 @@ pub const START_STEPS_PER_S: i32 = 50;
 /// the poll boundaries.
 pub const MAX_STEPS_PER_S: u32 = 1_000;
 
+/// How long a jog on the persistent link is honoured without a keepalive.
+///
+/// Much longer than [`JOG_TIMEOUT_US`], and safe to be, because on that path a
+/// client that disappears takes its socket with it and the motor is stopped by
+/// the close rather than by this. See [`Planner::jog_for`] for what a short one
+/// costs on a congested link.
+pub const LINK_JOG_TIMEOUT_US: u64 = 1_500_000;
+
 /// The longest a diagnostic hold will energise a winding.
 ///
 /// This exists to be measured with a meter, and a meter takes seconds, not
@@ -394,11 +402,58 @@ impl Planner {
         self.remaining
     }
 
+    /// Are the windings drawing current — moving, or holding position?
+    #[must_use]
+    pub const fn is_energised(&self) -> bool {
+        self.holding
+    }
+
+    /// Push a jog's deadline out without changing anything about the motion.
+    ///
+    /// A jog stops itself if it is not renewed, because over HTTP a controller
+    /// that vanished is indistinguishable from one that has not spoken lately.
+    /// The page used to renew it by re-sending the whole jog several times a
+    /// second; on the persistent link it costs one byte, and this is what that
+    /// byte does.
+    ///
+    /// Only a jog has a deadline. A bounded move ends by itself and must not
+    /// have one invented for it, and something already stopped must not be
+    /// given a reason to start.
+    pub const fn keepalive(&mut self, now_us: u64) {
+        self.keepalive_for(now_us, JOG_TIMEOUT_US);
+    }
+
+    /// A keepalive that grants a stated time. See [`Planner::jog_for`].
+    pub const fn keepalive_for(&mut self, now_us: u64, timeout_us: u64) {
+        if self.remaining.is_none() && self.target_rate != 0 {
+            self.expires_at_us = now_us + timeout_us;
+        }
+    }
+
     /// Run at a signed rate until told otherwise — or until the jog expires.
     ///
     /// Call again to refresh it. A rate of zero stops, which is what the
     /// trackpad sends when a finger lifts inside the dead zone.
     pub fn jog(&mut self, steps_per_s: i32, now_us: u64) {
+        self.jog_for(steps_per_s, now_us, JOG_TIMEOUT_US);
+    }
+
+    /// A jog that is honoured for a stated time rather than the default.
+    ///
+    /// The default is short because over HTTP a controller that vanished and
+    /// one that has merely gone quiet look identical, so the only safe reading
+    /// of silence is the pessimistic one.
+    ///
+    /// A persistent link does not have that problem: it reports the disconnect,
+    /// and the motor is stopped by the socket closing. There the deadline is a
+    /// second line of defence against a client that is still connected and no
+    /// longer thinking, and it costs nothing to make it tolerant — whereas
+    /// keeping it short costs a motor that stalls mid-drag whenever the network
+    /// hiccups for longer than the gap between keepalives. Measured on a busy
+    /// 2.4 GHz channel, round trips spiked past half a second while the median
+    /// stayed near 36 ms, and a 400 ms deadline stopped the motor repeatedly
+    /// with a finger still on the pad.
+    pub fn jog_for(&mut self, steps_per_s: i32, now_us: u64, timeout_us: u64) {
         let clamped = steps_per_s.clamp(-(MAX_STEPS_PER_S as i32), MAX_STEPS_PER_S as i32);
         if clamped == 0 {
             self.stop(now_us);
@@ -406,7 +461,7 @@ impl Planner {
         }
         self.remaining = None;
         self.begin(clamped, now_us);
-        self.expires_at_us = now_us + JOG_TIMEOUT_US;
+        self.expires_at_us = now_us + timeout_us;
     }
 
     /// Move a fixed number of steps and stop. Negative goes the other way.
@@ -1031,6 +1086,97 @@ mod tests {
         assert_eq!(json_i32(body, "steps_per_s"), Some(120));
         // Too large for i32 is None rather than a truncation nobody asked for.
         assert_eq!(json_i32(body, "seq"), None);
+    }
+
+    #[test]
+    fn a_keepalive_renews_a_jog_without_restarting_a_stopped_motor() {
+        let mut p = Planner::new(StepMode::Half);
+        p.jog(600, 0);
+        // Renewed just before each deadline, it keeps going well past the point
+        // an unrenewed jog would have been stopped.
+        let mut t = 0;
+        while t < 3 * SEC {
+            t += JOG_TIMEOUT_US - 1_000;
+            p.keepalive(t);
+            p.poll(t);
+        }
+        assert!(p.is_moving(), "a renewed jog was stopped anyway");
+
+        // ...but it is a renewal, not a start.
+        p.stop(t);
+        p.keepalive(t);
+        for u in t..t + JOG_TIMEOUT_US {
+            p.poll(u);
+        }
+        assert!(!p.is_moving(), "a keepalive restarted a stopped motor");
+    }
+
+    #[test]
+    fn the_link_deadline_outlives_a_network_stall_the_default_would_not() {
+        // The failure this fixes, reproduced: keepalives every 150 ms on a link
+        // that occasionally stalls for 600 ms. Under the default the motor
+        // stops with a finger still on the pad.
+        let stall_at = 300_000;
+        let stall_for = 600_000;
+        let run = |timeout: u64| {
+            let mut p = Planner::new(StepMode::Half);
+            p.jog_for(200, 0, timeout);
+            let mut t = 0;
+            let mut next_keepalive = 150_000;
+            while t < 2 * SEC {
+                t += 1_000;
+                // The stall: nothing arrives for 600 ms.
+                let stalled = (stall_at..stall_at + stall_for).contains(&t);
+                if t >= next_keepalive && !stalled {
+                    p.keepalive_for(t, timeout);
+                    next_keepalive = t + 150_000;
+                } else if stalled {
+                    next_keepalive = stall_at + stall_for;
+                }
+                p.poll(t);
+            }
+            p.is_moving()
+        };
+        assert!(!run(JOG_TIMEOUT_US), "the default survived a stall it should not");
+        assert!(
+            run(LINK_JOG_TIMEOUT_US),
+            "the link deadline stopped the motor during a stall the socket would have survived"
+        );
+    }
+
+    #[test]
+    fn a_keepalive_does_not_give_a_bounded_move_a_deadline() {
+        // A move ends when it has taken its steps. Handing it a watchdog would
+        // cut a long slow one short.
+        let mut p = Planner::new(StepMode::Half);
+        p.set_accel(1_000);
+        p.move_by(40, 20, 0);
+        p.keepalive(0);
+        let mut t = 0;
+        while t < 4 * SEC && p.remaining().is_some() {
+            t += 100;
+            p.poll(t);
+        }
+        assert_eq!(p.position(), 40, "the move did not finish");
+    }
+
+    #[test]
+    fn energised_tracks_the_windings_rather_than_the_motion() {
+        let mut p = Planner::new(StepMode::Half);
+        assert!(!p.is_energised());
+        p.jog(200, 0);
+        p.poll(0);
+        assert!(p.is_energised());
+
+        // Stopped but still holding position: not moving, still drawing current.
+        p.stop(SEC);
+        p.poll(SEC);
+        assert!(!p.is_moving());
+        assert!(p.is_energised(), "a held position should still be energised");
+
+        // Past the hold, the windings go.
+        p.poll(SEC + HOLD_AFTER_MOTION_US);
+        assert!(!p.is_energised());
     }
 
     #[test]

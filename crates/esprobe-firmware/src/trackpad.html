@@ -121,7 +121,6 @@
     </dl>
   </div>
 </main>
-
 <script>
 (() => {
   "use strict";
@@ -132,6 +131,11 @@
   const statDot = document.getElementById("stat");
   const statText = document.getElementById("statText");
 
+  // Must match src/link.rs. Little-endian both ends, so nothing byte-swaps.
+  const CMD_JOG = 0x01, CMD_STOP = 0x02, CMD_RELEASE = 0x03,
+        CMD_MOVE = 0x04, CMD_ACCEL = 0x05, CMD_PING = 0x06;
+  const MSG_STATUS = 0x81, MSG_PONG = 0x82;
+
   // Anything past this fraction of half-width is full speed; anything inside
   // the dead zone is a stop. Without a dead zone a finger resting a couple of
   // pixels off centre creeps the motor, which looks like a fault.
@@ -139,36 +143,75 @@
   let cap = Number(capEl.value);
   let jogging = false, sent = 0, pointer = null;
 
-  capEl.addEventListener("input", () => {
-    cap = Number(capEl.value);
-    capVal.textContent = cap + "/s";
-  });
+  // ---- the link -----------------------------------------------------------
+  //
+  // One socket, held open. A jog is three bytes; the same command as an HTTP
+  // POST was several hundred, plus a response, plus a new connection whenever
+  // keep-alive lapsed. Status arrives when it changes rather than being asked
+  // for twice a second.
+  let ws = null, live = false, reconnectIn = 250, rtt = null;
 
-  // How hard it is allowed to accelerate. The right value belongs to the motor,
-  // its supply and whatever is bolted to the shaft, none of which the firmware
-  // can see - so it is a slider to turn while the thing runs, and the symptom
-  // of going too far is a motor that buzzes without turning.
-  const accelEl = document.getElementById("accel");
-  const accelVal = document.getElementById("accelval");
-  let accelPending = null;
-  const accelText = v => (Number(v) >= Number(accelEl.max) ? "max" : v + "/s\u00b2");
-  accelEl.addEventListener("input", () => {
-    accelVal.textContent = accelText(accelEl.value);
-    // Dragging a slider fires continuously; one request per pixel would queue
-    // behind itself on four sockets and make the pad stutter.
-    clearTimeout(accelPending);
-    accelPending = setTimeout(() => {
-      post("/api/v1/stepper/config", {accel: Number(accelEl.value)});
-      accelPending = null;
-    }, 80);
-  });
+  function connect() {
+    const scheme = location.protocol === "https:" ? "wss://" : "ws://";
+    try {
+      ws = new WebSocket(scheme + location.host + "/ws/stepper");
+    } catch { retry(); return; }
+    ws.binaryType = "arraybuffer";
+    ws.onopen = () => {
+      live = true;
+      reconnectIn = 250;
+      setLink(true);
+    };
+    ws.onmessage = ev => {
+      const b = new Uint8Array(ev.data);
+      if (b[0] === MSG_STATUS && b.length === 12) {
+        const dv = new DataView(ev.data);
+        const flags = dv.getUint8(7);
+        showStatus({
+          position: dv.getInt32(1, true),
+          rate: dv.getInt16(5, true),
+          moving: (flags & 1) !== 0,
+          energised: (flags & 2) !== 0,
+          remaining: (flags & 4) ? dv.getUint32(8, true) : null,
+        });
+      } else if (b[0] === MSG_PONG && pinged !== null) {
+        rtt = Math.round(performance.now() - pinged);
+        pinged = null;
+      }
+    };
+    ws.onclose = () => { live = false; setLink(false); retry(); };
+    // An error is always followed by a close, so the reconnect lives there
+    // alone rather than being raced for by both.
+    ws.onerror = () => {};
+  }
 
-  // Every command is stamped and the firmware drops motion that arrives out of
-  // order. Milliseconds since the epoch, so a reload cannot rewind the sequence
-  // and have its first jog ignored as stale.
+  function retry() {
+    // Backed off, because a station that is off should not be hammered by a
+    // tab someone left open. Capped low, because the usual reason for a close
+    // is a moment of bad Wi-Fi and the pad should come back before it is
+    // noticed.
+    setTimeout(connect, reconnectIn);
+    reconnectIn = Math.min(reconnectIn * 2, 3000);
+  }
+
+  // Dropped rather than queued. If the socket has backed up, the rate in the
+  // frame waiting to go is already wrong — a newer one is a few milliseconds
+  // behind it — and sending both puts the motor through a position the finger
+  // has already left. Stops are never dropped.
+  const BACKLOG = 64;
+  function wsSend(bytes, always) {
+    if (!live) return false;
+    if (!always && ws.bufferedAmount > BACKLOG) return true;
+    try { ws.send(bytes); return true; } catch { return false; }
+  }
+
+  // ---- commands -----------------------------------------------------------
+  //
+  // Each falls back to the REST route when the socket is down, so the station
+  // stays usable while it reconnects. The REST path stamps a sequence because
+  // two requests can overtake each other; the socket does not need one,
+  // because a single TCP connection delivers in the order it was written.
   let seq = Date.now();
-  // Jogs in flight when the finger lifts. Aborting them locally is the first
-  // line - the sequence number is the second, for the ones that already left.
   let inFlight = null;
 
   async function post(path, body, opts) {
@@ -183,14 +226,93 @@
         headers: {"Content-Type": "application/json"},
         body: JSON.stringify(Object.assign({seq: ++seq}, body || {})),
         signal: AbortSignal.any(signals),
-        // Survives the page being hidden or closed mid-request, which is
-        // exactly when the stop is sent.
         keepalive: !(opts && opts.abortable),
       });
       return r.ok;
     } catch { return false; }
   }
 
+  function jogCmd(rate) {
+    const b = new DataView(new ArrayBuffer(3));
+    b.setUint8(0, CMD_JOG);
+    b.setInt16(1, rate, true);
+    if (!wsSend(b.buffer, false)) {
+      post("/api/v1/stepper/jog", {steps_per_s: rate}, {abortable: true});
+    }
+  }
+
+  function stopCmd() {
+    if (inFlight) { inFlight.abort(); inFlight = null; }
+    if (!wsSend(new Uint8Array([CMD_STOP]), true)) {
+      post("/api/v1/stepper/stop", {});
+    }
+  }
+
+  function releaseCmd() {
+    if (!wsSend(new Uint8Array([CMD_RELEASE]), true)) {
+      post("/api/v1/stepper/release", {});
+    }
+  }
+
+  function moveCmd(steps, rate) {
+    const b = new DataView(new ArrayBuffer(7));
+    b.setUint8(0, CMD_MOVE);
+    b.setInt32(1, steps, true);
+    b.setUint16(5, Math.min(65535, Math.max(0, rate)), true);
+    if (!wsSend(b.buffer, true)) {
+      post("/api/v1/stepper/move", {steps: steps, steps_per_s: rate});
+    }
+  }
+
+  function accelCmd(accel) {
+    const b = new DataView(new ArrayBuffer(5));
+    b.setUint8(0, CMD_ACCEL);
+    b.setInt32(1, accel, true);
+    if (!wsSend(b.buffer, true)) {
+      post("/api/v1/stepper/config", {accel: accel});
+    }
+  }
+
+  // ---- status -------------------------------------------------------------
+  function setLink(up) {
+    statDot.className = up ? "stat on" : "stat err";
+    statText.textContent = up
+      ? (rtt === null ? "linked" : "linked · " + rtt + " ms")
+      : "reconnecting…";
+  }
+
+  function showStatus(s) {
+    document.getElementById("pos").textContent = s.position;
+    document.getElementById("rate").textContent = s.rate + " steps/s";
+    document.getElementById("rem").textContent =
+      s.remaining === null ? (s.energised ? "holding" : "—") : s.remaining;
+  }
+
+  capEl.addEventListener("input", () => {
+    cap = Number(capEl.value);
+    capVal.textContent = cap + "/s";
+  });
+
+  // How hard it is allowed to accelerate. The right value belongs to the motor,
+  // its supply and whatever is bolted to the shaft, none of which the firmware
+  // can see - so it is a slider to turn while the thing runs, and the symptom
+  // of going too far is a motor that buzzes without turning.
+  const accelEl = document.getElementById("accel");
+  const accelVal = document.getElementById("accelval");
+  const accelText = v => (Number(v) >= Number(accelEl.max) ? "max" : v + "/s²");
+  let accelPending = null;
+  accelEl.addEventListener("input", () => {
+    accelVal.textContent = accelText(accelEl.value);
+    // Dragging a slider fires continuously; one frame per pixel would sit in
+    // the send buffer ahead of the jogs that matter.
+    clearTimeout(accelPending);
+    accelPending = setTimeout(() => {
+      accelCmd(Number(accelEl.value));
+      accelPending = null;
+    }, 80);
+  });
+
+  // ---- the pad ------------------------------------------------------------
   function rateFor(x) {
     const half = pad.clientWidth / 2;
     let f = (x - half) / half;                 // -1 .. 1
@@ -209,10 +331,23 @@
     knob.style.transform = "translateX(" + (x - half) + "px)";
   }
 
-  // The firmware stops on its own if it stops hearing from us, so this only
-  // has to be more often than that deadline — not fast.
-  const REFRESH_MS = 120;
-  let timer = null;
+  // The firmware stops a jog that goes unrenewed, because a controller that
+  // vanished looks like one that has gone quiet. Renewing it used to mean
+  // re-sending the whole jog several times a second; it is now one byte, and
+  // it doubles as the round-trip measurement shown next to the link.
+  const KEEPALIVE_MS = 150;
+  let timer = null, pinged = null;
+
+  function keepalive() {
+    if (!jogging) return;
+    if (pinged === null) pinged = performance.now();
+    if (!wsSend(new Uint8Array([CMD_PING]), false)) {
+      // No socket: the REST path has no keepalive, so the jog itself is what
+      // has to be repeated.
+      post("/api/v1/stepper/jog", {steps_per_s: sent}, {abortable: true});
+    }
+    setLink(live);
+  }
 
   function begin(e) {
     pointer = e.pointerId;
@@ -220,7 +355,7 @@
     pad.classList.add("live");
     jogging = true;
     move(e);
-    if (!timer) timer = setInterval(() => { if (jogging) post("/api/v1/stepper/jog", {steps_per_s: sent}, {abortable: true}); }, REFRESH_MS);
+    if (!timer) timer = setInterval(keepalive, KEEPALIVE_MS);
   }
 
   function move(e) {
@@ -228,7 +363,7 @@
     const x = e.clientX - pad.getBoundingClientRect().left;
     drawKnob(Math.max(0, Math.min(pad.clientWidth, x)));
     const r = rateFor(x);
-    if (r !== sent) { sent = r; post("/api/v1/stepper/jog", {steps_per_s: r}, {abortable: true}); }
+    if (r !== sent) { sent = r; jogCmd(r); }
   }
 
   function end() {
@@ -237,15 +372,10 @@
     pad.classList.remove("live");
     knob.style.transform = "translateX(0px)";
     if (timer) { clearInterval(timer); timer = null; }
-    // Abandon every jog still in flight before sending the stop. One of those
-    // landing afterwards is a motor that carries on after being released, and
-    // the ones that already reached the wire are caught by the sequence number
-    // instead - the stop is stamped later than all of them.
-    if (inFlight) { inFlight.abort(); inFlight = null; }
-    // Immediately, and not chased by a second message on a timer: the stop is
-    // now the highest-numbered command, so nothing can overtake it and there is
-    // nothing left for a retry to fix.
-    post("/api/v1/stepper/stop", {});
+    // One message, sent once. On the socket it cannot be overtaken by a jog
+    // that is still in flight, because the connection delivers in order — the
+    // thing the REST path needs a sequence number to guarantee.
+    stopCmd();
   }
 
   pad.addEventListener("pointerdown", begin);
@@ -259,18 +389,20 @@
   window.addEventListener("blur", end);
 
   for (const b of document.querySelectorAll("button[data-step]")) {
-    b.addEventListener("click", () =>
-      post("/api/v1/stepper/move", {steps: Number(b.dataset.step), steps_per_s: cap}));
+    b.addEventListener("click", () => moveCmd(Number(b.dataset.step), cap));
   }
-  document.getElementById("stop").addEventListener("click", () => post("/api/v1/stepper/stop", {}));
-  document.getElementById("release").addEventListener("click", () => post("/api/v1/stepper/release", {}));
+  document.getElementById("stop").addEventListener("click", stopCmd);
+  document.getElementById("release").addEventListener("click", releaseCmd);
 
-  // Bring-up aids. Both answer questions that otherwise need a meter, and both
-  // were needed the first time this board met a motor.
+  // ---- bring-up aids ------------------------------------------------------
+  //
+  // These stay on the REST routes. They run at a few frames a second, none of
+  // them is on the path between a finger and a shaft, and a diagnostic that
+  // works when the socket does not is worth more than a fast one.
   const diag = document.getElementById("diag");
 
   document.getElementById("selftest").addEventListener("click", async () => {
-    diag.textContent = "driving each pin and reading it back\u2026";
+    diag.textContent = "driving each pin and reading it back…";
     try {
       const r = await fetch("/api/v1/stepper/selftest",
                             {method: "POST", signal: AbortSignal.timeout(4000)});
@@ -278,14 +410,11 @@
       const bad = s.pins.filter(p => !p.drove_high || !p.drove_low);
       diag.textContent = bad.length
         ? "not driving: " + bad.map(p => p.name + " (gpio " + p.gpio + ")").join(", ")
-        : "all four pins drive and read back. Any fault is past the pin \u2014 "
+        : "all four pins drive and read back. Any fault is past the pin — "
           + "wiring, supply, or the driver itself.";
     } catch { diag.textContent = "the station did not answer the self-test."; }
   });
 
-  // Reverses both coils twice a second. It cannot rotate more than a step or
-  // two either way, and it is the loudest thing the driver can be made to do,
-  // so a hand on the motor answers "is any current flowing at all".
   let buzzing = null;
   const buzzBtn = document.getElementById("buzz");
 
@@ -293,11 +422,18 @@
   // dead or miscabled coil, which is the fault that looks like "one click
   // forward, one click back" - with a single coil the half-step sequence goes
   // +,+,0,-,-,-,0,+ and never advances.
+  const wiggles = [];
+  function stopWiggles() {
+    while (wiggles.length) { wiggles.pop()(); }
+    if (buzzing) { clearInterval(buzzing); buzzing = null; buzzBtn.textContent = "Buzz coils"; }
+    releaseCmd();
+  }
   function coilTest(button, label, states) {
     let timer = null, flip = 0;
     button.addEventListener("click", () => {
-      stopWiggles(timer);
-      if (timer) { timer = null; button.textContent = label; return; }
+      const wasRunning = timer !== null;
+      stopWiggles();
+      if (wasRunning) { timer = null; button.textContent = label; return; }
       timer = setInterval(() => {
         post("/api/v1/stepper/hold", {state: states[flip++ % 2], seconds: 2});
       }, 500);
@@ -307,25 +443,11 @@
         + " is energised. No movement here means this winding is open or miscabled.";
     });
   }
-  // Every wiggle stops the others: two coils driven by two independent timers
-  // would interleave holds and tell you nothing.
-  const wiggles = [];
-  function stopWiggles(keep) {
-    while (wiggles.length) { wiggles.pop()(); }
-    if (buzzing) { clearInterval(buzzing); buzzing = null; buzzBtn.textContent = "Buzz coils"; }
-    post("/api/v1/stepper/release", {});
-  }
   coilTest(document.getElementById("coilA"), "Wiggle A", [0, 4]);
   coilTest(document.getElementById("coilB"), "Wiggle B", [2, 6]);
 
   buzzBtn.addEventListener("click", () => {
-    if (buzzing) {
-      clearInterval(buzzing); buzzing = null;
-      buzzBtn.textContent = "Buzz coils";
-      post("/api/v1/stepper/release", {});
-      diag.textContent = "stopped.";
-      return;
-    }
+    if (buzzing) { stopWiggles(); diag.textContent = "stopped."; return; }
     stopWiggles();
     let flip = 0;
     // `seconds` outlives the interval on purpose: if this page dies mid-buzz
@@ -335,33 +457,31 @@
       post("/api/v1/stepper/hold", {state: (flip++ % 2) ? 5 : 1, seconds: 2});
     }, 400);
     buzzBtn.textContent = "Stop buzzing";
-    diag.textContent = "buzzing \u2014 put a finger on the motor body.";
+    diag.textContent = "buzzing — put a finger on the motor body.";
   });
-  window.addEventListener("pagehide", () => { if (buzzing) post("/api/v1/stepper/release", {}); });
+  window.addEventListener("pagehide", () => { if (buzzing || wiggles.length) releaseCmd(); });
 
-  async function refresh() {
-    try {
-      const r = await fetch("/api/v1/stepper", {signal: AbortSignal.timeout(1500)});
-      const s = await r.json();
-      statDot.className = "stat on"; statText.textContent = "online";
-      document.getElementById("pos").textContent = s.position;
-      document.getElementById("rate").textContent = s.steps_per_s + " steps/s";
-      document.getElementById("rem").textContent = s.remaining === null ? "—" : s.remaining;
-      // Only while the slider is idle: adopting the firmware's value mid-drag
-      // would fight the finger holding it.
-      if (accelPending === null && Number(accelEl.value) !== s.accel && s.accel !== undefined) {
+  // One read at start-up for the fields the push does not carry — the rate
+  // ceiling and the acceleration the firmware booted with. After this the
+  // socket is the only thing that updates anything.
+  fetch("/api/v1/stepper", {signal: AbortSignal.timeout(2000)})
+    .then(r => r.json())
+    .then(s => {
+      if (Number(capEl.max) !== s.max_steps_per_s) {
+        capEl.max = s.max_steps_per_s;
+        if (cap > s.max_steps_per_s) {
+          capEl.value = s.max_steps_per_s;
+          capEl.dispatchEvent(new Event("input"));
+        }
+      }
+      if (s.accel !== undefined) {
         accelEl.value = s.accel;
         accelVal.textContent = accelText(s.accel);
       }
-      if (Number(capEl.max) !== s.max_steps_per_s) {
-        capEl.max = s.max_steps_per_s;
-        if (cap > s.max_steps_per_s) { capEl.value = s.max_steps_per_s; capEl.dispatchEvent(new Event("input")); }
-      }
-    } catch {
-      statDot.className = "stat err"; statText.textContent = "no answer";
-    }
-  }
-  refresh(); setInterval(refresh, 500);
+    })
+    .catch(() => {});
+
+  connect();
 })();
 </script>
 </body>
