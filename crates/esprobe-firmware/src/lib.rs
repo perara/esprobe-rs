@@ -1,5 +1,15 @@
 //! Hardware-neutral contracts for the ESP32-C3 carrier board.
 
+pub mod link;
+
+/// Where the persistent link is served.
+///
+/// In the library rather than beside the handler, because the page has to name
+/// the same string and a test can only check that if both sides can see it.
+#[must_use]
+pub const fn ws_link_path() -> &'static str {
+    "/ws/actuator"
+}
 pub mod safety;
 
 /// The credential codec, shared with the host tool.
@@ -97,10 +107,17 @@ pub mod control page {
 
         #[test]
         fn the_page_stays_small_enough_to_serve_from_flash() {
-            // Not a hard limit, a tripwire. It is sent over an access point
-            // that is also carrying jog commands, so it doubling in size is
-            // something to notice rather than discover.
-            const BUDGET: usize = 16 * 1024;
+            // Not a hard limit, a tripwire. It fired once, correctly, when the
+            // page grew a websocket client and a REST fallback beside it.
+            //
+            // The reason for the original figure has weakened since: commands
+            // no longer share the air with the page, because they are on their
+            // own socket, and the page is served with an ETag so a returning
+            // browser gets a 304 and no body at all. What is left is one
+            // transfer on a cold load. If this fires again the answer is
+            // probably to serve it gzipped rather than to raise it a second
+            // time — roughly two thirds of it is comments and whitespace.
+            const BUDGET: usize = 24 * 1024;
             assert!(
                 PAGE.len() <= BUDGET,
                 "the page is {} bytes, over the {BUDGET}-byte budget",

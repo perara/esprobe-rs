@@ -4,3 +4,11 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
 CONFIG_HTTPD_MAX_URI_LEN=128
+
+# The control page holds one socket open instead of posting a request per command.
+# Without this the websocket handler is compiled out of esp-idf-svc entirely.
+CONFIG_HTTPD_WS_SUPPORT=y
+# Every page holding the link open occupies a socket for as long as it is open,
+# where a REST client occupied one for milliseconds. The default budget was
+# reached by a handful of tabs, after which the board answered nothing at all.
+CONFIG_LWIP_MAX_SOCKETS=16
