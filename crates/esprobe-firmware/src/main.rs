@@ -2088,13 +2088,24 @@ mod app {
                 return Ok::<(), anyhow::Error>(());
             };
             let now = unsafe { esp_idf_svc::sys::esp_timer_get_time() } as u64;
-            let applied = {
+            let seq = esprobe_firmware::actuator::json_i64(&body, "seq");
+            let (applied, stale) = {
                 let mut planner = state.lock().map_err(|_| anyhow!("actuator lock poisoned"))?;
-                planner.jog(rate, now);
-                planner.rate()
+                // A jog that lost a race with a later command is dropped rather
+                // than obeyed. The case this exists for is one still in flight
+                // when a finger lifts, which would otherwise land after the stop
+                // and run the motor until the watchdog caught it.
+                if planner.accept(seq) {
+                    planner.jog(rate, now);
+                    (planner.rate(), false)
+                } else {
+                    (planner.rate(), true)
+                }
             };
-            req.into_ok_response()?
-                .write_all(format!("{{\"ok\":true,\"steps_per_s\":{applied}}}\n").as_bytes())?;
+            req.into_ok_response()?.write_all(
+                format!("{{\"ok\":true,\"steps_per_s\":{applied},\"stale\":{stale}}}\n")
+                    .as_bytes(),
+            )?;
             Ok::<(), anyhow::Error>(())
         })?;
 
@@ -2117,12 +2128,19 @@ mod app {
             // the nudge buttons only ever vary the distance.
             let rate = esprobe_firmware::actuator::json_i32(&body, "steps_per_s").unwrap_or(300);
             let now = unsafe { esp_idf_svc::sys::esp_timer_get_time() } as u64;
-            {
+            let seq = esprobe_firmware::actuator::json_i64(&body, "seq");
+            let stale = {
                 let mut planner = state.lock().map_err(|_| anyhow!("actuator lock poisoned"))?;
-                planner.move_by(steps, rate.max(0) as u32, now);
-            }
-            req.into_ok_response()?
-                .write_all(format!("{{\"ok\":true,\"steps\":{steps}}}\n").as_bytes())?;
+                if planner.accept(seq) {
+                    planner.move_by(steps, rate.max(0) as u32, now);
+                    false
+                } else {
+                    true
+                }
+            };
+            req.into_ok_response()?.write_all(
+                format!("{{\"ok\":true,\"steps\":{steps},\"stale\":{stale}}}\n").as_bytes(),
+            )?;
             Ok::<(), anyhow::Error>(())
         })?;
 
@@ -2262,11 +2280,21 @@ mod app {
             (esprobe_firmware::control page::RELEASE, true),
         ] {
             let state = actuator.clone();
-            server.fn_handler(path, Method::Post, move |req| {
+            server.fn_handler(path, Method::Post, move |mut req| {
                 let now = unsafe { esp_idf_svc::sys::esp_timer_get_time() } as u64;
+                // A malformed or absent body must not stop this from stopping.
+                // Everything here is best-effort except the stop itself, which
+                // is the one command with no safe failure mode.
+                let seq = read_body(&mut req)
+                    .ok()
+                    .and_then(|body| esprobe_firmware::actuator::json_i64(&body, "seq"));
                 {
                     let mut planner =
                         state.lock().map_err(|_| anyhow!("actuator lock poisoned"))?;
+                    // Recorded, not gated: this is what makes an overtaken jog
+                    // stale, and there is no reading of a dropped stop that
+                    // leaves the motor safer.
+                    planner.observe(seq);
                     if release {
                         planner.release(now);
                     } else {
