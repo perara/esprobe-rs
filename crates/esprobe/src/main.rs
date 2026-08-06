@@ -177,8 +177,15 @@ enum Action {
         #[arg(long, default_value_t = 2)]
         seconds: u64,
     },
-    /// Ask the running STM32 Rust firmware to jump to its ROM UART bootloader.
-    EnterRomBoot,
+    /// Speak the STM32 ROM bootloader's autobaud handshake and report the reply.
+    ///
+    /// Says nothing about how the target got into system memory: send your own
+    /// firmware's command with `uart-send`, or use `boot0-entry`, then run this
+    /// to see whether the ROM is listening. A reply of 79 is ACK.
+    RomSync,
+    /// Reset the target with BOOT0 asserted, the hardware route into the ROM
+    /// bootloader. Whether the pin is honoured is an option-byte decision.
+    Boot0Entry,
     /// Passively capture bytes from the STM32 display UART.
     UartReceive {
         /// How long to listen, in milliseconds. The bridge clears the receive
@@ -527,13 +534,26 @@ fn main() -> Result<()> {
             println!("swdio=released swclk=released reset_all=released");
             return Ok(());
         }
-        Action::EnterRomBoot => {
-            let response = serial.command(Command::EnterRomBoot, &[])?;
-            print!("stm32_uart_response=");
-            for byte in response {
+        Action::RomSync => {
+            let response = serial.command(Command::RomSync, &[])?;
+            print!("rom_reply=");
+            for byte in &response {
                 print!("{byte:02x}");
             }
-            println!();
+            // 0x79 is the bootloader's ACK; anything else means it is not there.
+            println!(
+                "{}",
+                if response.contains(&0x79) {
+                    "  (ACK - ROM bootloader is listening)"
+                } else {
+                    "  (no ACK - target is not in the ROM bootloader)"
+                }
+            );
+            return Ok(());
+        }
+        Action::Boot0Entry => {
+            serial.command(Command::Boot0Entry, &[])?;
+            println!("boot0=asserted reset=cycled");
             return Ok(());
         }
         Action::UartSend { hex } => {
@@ -1058,8 +1078,8 @@ fn main() -> Result<()> {
         Action::SwdioCycle { .. } => {
             unreachable!("SWDIO cycle returned before probe attachment")
         }
-        Action::EnterRomBoot => {
-            unreachable!("ROM boot command returned before probe attachment")
+        Action::RomSync | Action::Boot0Entry => {
+            unreachable!("ROM bootloader commands return before probe attachment")
         }
         Action::Core(action) => {
             run_core(&mut session, &action)?;
