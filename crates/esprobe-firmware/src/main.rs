@@ -158,10 +158,16 @@ mod app {
         fn bind_disp_tx() -> Result<()> {
             // SAFETY: the pin belongs to this driver and the port is open.
             esp_idf_svc::sys::esp!(unsafe {
+                // Both pins, not just the transmitter. `uart_set_pin` with
+                // NO_CHANGE for the receiver is documented to leave it alone,
+                // but a reply that never arrived after a send - on a board
+                // whose receive path is otherwise proven - is exactly what a
+                // disturbed receive routing looks like, and naming both costs
+                // nothing on a call that already runs once per command.
                 uart_set_pin(
                     uart_port_t_UART_NUM_1,
                     pinmap::DISP_TX,
-                    UART_PIN_NO_CHANGE,
+                    pinmap::DISP_RX,
                     UART_PIN_NO_CHANGE,
                     UART_PIN_NO_CHANGE,
                 )
