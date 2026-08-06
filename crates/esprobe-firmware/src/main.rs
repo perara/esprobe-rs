@@ -519,55 +519,24 @@ mod app {
                     response[0] = u8::from(observed);
                     Ok(1)
                 }
-                BridgeCommand::EnterRomBoot => {
-                    // Existing STM32 Rust firmware CfgSet:
-                    // ns=FLASH(3), sub=OTA(0), key=ENTER_ROM_BOOT(5).
-                    // Frame is COBS with CRC16/CCITT-FALSE and delimiter.
-                    const ENTER_ROM_BOOT_FRAME: [u8; 10] = [5, 1, 0x41, 3, 3, 4, 5, 0xa0, 0x62, 0];
+                BridgeCommand::RomSync => {
+                    // The STM32 system-memory bootloader's autobaud handshake
+                    // (AN3155): it runs at 8E1, takes 0x7F, and answers ACK.
+                    //
+                    // Deliberately knows nothing about how the target got here.
+                    // Asking an application to jump to its bootloader means
+                    // speaking that application's protocol, and a debug probe
+                    // that hard-codes one product's config frames stops being a
+                    // probe. The host sends whatever its own firmware needs via
+                    // `uart-send`, then calls this to see whether the ROM
+                    // answered.
                     if !payload.is_empty() {
                         return Err(SwdError::Protocol(0));
                     }
-                    if let Some(swd) = self.swd.as_mut() {
-                        swd.disconnect();
-                    }
-                    self.display
-                        .change_parity(Parity::ParityNone)
-                        .map_err(|_| SwdError::Protocol(0))?;
-                    self.display.clear_rx().map_err(|_| SwdError::Protocol(0))?;
-                    Self::bind_disp_tx().map_err(|_| SwdError::Protocol(0))?;
-                    self.display
-                        .write(&ENTER_ROM_BOOT_FRAME)
-                        .map_err(|_| SwdError::Protocol(0))?;
-                    self.display
-                        .wait_tx_done(100)
-                        .map_err(|_| SwdError::Protocol(0))?;
-                    // DISP_TX stays bound; see the constructor.
-                    let mut length = self.display.read(response, 100).unwrap_or(0);
-                    if length == 0 {
-                        // Older application firmware may not implement the
-                        // software ROM jump. Try the PA14/BOOT0 reset entry;
-                        // option bytes decide whether the pin is honored.
-                        self.reset_all
-                            .set_low()
-                            .map_err(|_| SwdError::Protocol(0))?;
-                        self.hold_reset(true).map_err(|_| SwdError::Protocol(0))?;
-                        self.swd
-                            .as_mut()
-                            .ok_or(SwdError::Protocol(0))?
-                            .diagnostic_drive_boot0(true);
-                        thread::sleep(Duration::from_millis(10));
-                        self.hold_reset(false).map_err(|_| SwdError::Protocol(0))?;
-                        thread::sleep(Duration::from_millis(10));
-                        self.swd.as_mut().ok_or(SwdError::Protocol(0))?.disconnect();
-                    }
-                    thread::sleep(Duration::from_millis(100));
-                    // STM32 system-memory USART bootloader uses 8E1. The
-                    // application command above is 8N1, so parity must change
-                    // only after the application had a chance to jump.
                     self.display
                         .change_parity(Parity::ParityEven)
                         .map_err(|_| SwdError::Protocol(0))?;
-                    let rom_sync = (|| {
+                    let sync = (|| {
                         self.display.clear_rx().map_err(|_| SwdError::Protocol(0))?;
                         Self::bind_disp_tx().map_err(|_| SwdError::Protocol(0))?;
                         self.display
@@ -576,18 +545,38 @@ mod app {
                         self.display
                             .wait_tx_done(100)
                             .map_err(|_| SwdError::Protocol(0))?;
-                        // DISP_TX stays bound; see the constructor.
-                        Ok(self.display.read(&mut response[length..], 100).unwrap_or(0))
+                        Ok(self.display.read(response, 200).unwrap_or(0))
                     })();
-                    // Restore the shared display UART even if ROM sync failed.
-                    // DISP_TX stays bound; see the constructor.
+                    // Restore 8N1 whatever happened: the display UART is shared
+                    // and every other user of it speaks no parity.
                     let parity_restore = self
                         .display
                         .change_parity(Parity::ParityNone)
                         .map_err(|_| SwdError::Protocol(0));
-                    length += rom_sync?;
+                    let length = sync?;
                     parity_restore?;
                     Ok(length)
+                }
+                BridgeCommand::Boot0Entry => {
+                    // The hardware route into system memory, for a target whose
+                    // application cannot be asked nicely - or has none. Option
+                    // bytes decide whether BOOT0 is honoured at all.
+                    if !payload.is_empty() {
+                        return Err(SwdError::Protocol(0));
+                    }
+                    self.reset_all
+                        .set_low()
+                        .map_err(|_| SwdError::Protocol(0))?;
+                    self.hold_reset(true).map_err(|_| SwdError::Protocol(0))?;
+                    self.swd
+                        .as_mut()
+                        .ok_or(SwdError::Protocol(0))?
+                        .diagnostic_drive_boot0(true);
+                    thread::sleep(Duration::from_millis(10));
+                    self.hold_reset(false).map_err(|_| SwdError::Protocol(0))?;
+                    thread::sleep(Duration::from_millis(10));
+                    self.swd.as_mut().ok_or(SwdError::Protocol(0))?.disconnect();
+                    Ok(0)
                 }
                 BridgeCommand::UartSend => {
                     // Write to the STM32's control UART and capture whatever it

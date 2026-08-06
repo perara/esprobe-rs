@@ -31,7 +31,9 @@ pub enum Command {
     PadSelfTest = 0x18,
     RecoveryProbe = 0x19,
     DiagnosticSwdio = 0x1a,
-    EnterRomBoot = 0x1b,
+    /// Speak the STM32 system-memory bootloader's autobaud handshake (AN3155):
+    /// switch the display UART to 8E1, send 0x7F, report the reply, restore 8N1.
+    RomSync = 0x1b,
     UartReceive = 0x1c,
     UartResetCapture = 0x1d,
     MuxProbe = 0x1e,
@@ -54,6 +56,9 @@ pub enum Command {
     WifiSet = 0x2f,
     WifiForget = 0x30,
     UartSend = 0x31,
+    /// Reset the target with BOOT0 asserted, the hardware route into system
+    /// memory. Whether the pin is honoured is an option-byte decision.
+    Boot0Entry = 0x32,
 }
 
 impl TryFrom<u8> for Command {
@@ -75,9 +80,10 @@ impl TryFrom<u8> for Command {
             0x18 => Ok(Self::PadSelfTest),
             0x19 => Ok(Self::RecoveryProbe),
             0x1a => Ok(Self::DiagnosticSwdio),
-            0x1b => Ok(Self::EnterRomBoot),
+            0x1b => Ok(Self::RomSync),
             0x1c => Ok(Self::UartReceive),
             0x31 => Ok(Self::UartSend),
+            0x32 => Ok(Self::Boot0Entry),
             0x1d => Ok(Self::UartResetCapture),
             0x1e => Ok(Self::MuxProbe),
             0x1f => Ok(Self::ReadRegisterBlock),
@@ -377,7 +383,7 @@ mod tests {
         assert_eq!(Command::try_from(0x18), Ok(Command::PadSelfTest));
         assert_eq!(Command::try_from(0x19), Ok(Command::RecoveryProbe));
         assert_eq!(Command::try_from(0x1a), Ok(Command::DiagnosticSwdio));
-        assert_eq!(Command::try_from(0x1b), Ok(Command::EnterRomBoot));
+        assert_eq!(Command::try_from(0x1b), Ok(Command::RomSync));
         assert_eq!(Command::try_from(0x1c), Ok(Command::UartReceive));
         assert_eq!(Command::try_from(0x31), Ok(Command::UartSend));
         assert_eq!(Command::try_from(0x1d), Ok(Command::UartResetCapture));
