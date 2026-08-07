@@ -338,12 +338,14 @@ way. `wire-probe` sends a DPIDR read and returns the reply undecoded, so a
 backend's actual bit placement can be read off rather than assumed.
 
 `lines` releases both ESP pins to inputs and reports their physical idle
-levels. A powered/reset STM32 normally presents SWDIO high and SWCLK low;
+levels. A powered, idle ARM debug port normally presents SWDIO high and SWCLK
+low — the ADIv5-recommended arrangement, and a convention rather than a
+guarantee, so a target that idles otherwise is refused rather than assumed;
 `reset-lines` performs the same passive sampling while reset is held
 low and again after release, without producing any SWD clock;
 `reset-assert` holds the shared reset net low for meter measurements until
-`reset-release` or an ESP reboot returns GPIO7 to high impedance. This resets
-the STM32 and both AUX modules. `reset-cycle` alternates between those states
+`reset-release` or an ESP reboot returns the pin to high impedance.
+`reset-cycle` alternates between those states
 and releases reset when Ctrl-C stops it;
 `swdio=0` is a fail-closed indication to check target power and wiring. The firmware
 refuses to start an SWD transaction when released SWDIO is low (bridge
@@ -356,21 +358,21 @@ path electrically safe.
 `probe-under-reset` is an explicit recovery path for a powered target that was
 previously programmed successfully but leaves SWDIO passive-low. It asserts
 reset, prepares the SWD pin state, releases it to the target's pull-up, and
-attaches immediately before application firmware can reclaim PA13/PA14. It
-never enables STM32 erase or programming by itself.
+attaches immediately, before application firmware can reclaim the debug pins.
+It never erases or programs anything by itself.
 
-`enter-rom-boot` first sends the current Rust firmware's COBS/CRC command at
-115200 8N1. It then changes UART1 to the STM32 ROM bootloader's required
-115200 8E1 format before sending sync byte `0x7f`. If the application command
-does not answer, it also tries PA14/BOOT0 during reset. `uart-receive` is a
-passive capture, while `uart-reset-capture` resets and captures startup bytes
-atomically so host reconnection cannot miss them. An empty response is not a
-successful bootloader handshake; ROM flashing must require ACK `0x79`.
+`uart-receive` is a passive capture on the target's transmit line, and
+`uart-reset-capture` resets and captures startup bytes atomically so a host
+reconnection cannot miss them. `uart-send` writes and reads back in one round
+trip, and refuses to drive the line at all unless released SWDIO proves the
+target is powered.
 
-`lines` verifies the released pad levels, passively
-samples all four U14 channels, and performs read-only DP identification only
-on STM32/AUX channels whose released SWDIO is high. It always restores the
-all-low STM32 selection. `recovery-probe --delay-us` permits a bounded sweep
+A vendor's ROM-bootloader handshake used to live here — an autobaud sync at
+8E1, and a strapping pin held across reset. Both are that vendor's flashing
+protocol rather than anything about a debug port, so they moved to the product
+that fits that vendor's chip, on opcodes in the reserved extension range.
+
+`lines` verifies the released pad levels. `recovery-probe --delay-us` permits a bounded sweep
 across the reset-RC/application-start window without rebuilding firmware.
 `uart-reset-capture --swapped` is passive and exists only to exclude reversed
 serial-line direction during bring-up.
@@ -503,12 +505,10 @@ Raise the clock only after repeated identity reads succeed on the assembled
 board; through an analog switch its settling time, not the engine, sets the
 ceiling.
 
-On one board, at boot GPIO5 serial TX, GPIO7 reset, GPIO4
-SWDIO, and GPIO3 SWCLK remain inputs. Any operation
-that would drive a high level first reselects STM32 and requires its released
-SWDIO pull-up to be visible. Serial TX is enabled only for the duration of a
-power-gated transmission, and GPIO7 asserts reset low before returning to an
-input so the carrier board's 10 kΩ pull-up performs the release.
+Every pad stays an input at boot. Any operation that would drive a high level
+first releases the pads and requires the target's own SWDIO pull-up to be
+visible, and reset is asserted low before returning to an input so the target's
+pull-up performs the release — this firmware never drives reset high.
 
 `--port` defaults to the only attached Espressif USB Serial/JTAG device, so a
 replacement board needs no rebuild; pass it explicitly when more than one is
@@ -530,15 +530,12 @@ nothing here is needed to use `esprobe`.
 
 ```bash
 curl http://PROBE_IP/health                        # address, SSID, liveness
-curl -X POST http://PROBE_IP/api/v1/stm32/probe    # identify the attached target
-curl --data-binary @firmware.bin \
-  http://PROBE_IP/api/v1/stm32/flash               # program it
 ```
 
 ## Validation boundary
 
-Host tests prove pin constants, framing/CRC behavior, and
-hardware-neutral SWD/flash logic. A successful USB handshake proves only that
+Host tests prove pin constants, framing/CRC behavior, and the hardware-neutral
+SWD logic, and run in CI. A successful USB handshake proves only that
 the ESP bridge is alive. A probe-rs attach proves target-side SWD transactions;
 programming plus enabled readback verification proves the downloaded image.
 None of these replace signal-integrity, strap-voltage, timing, or IR waveform
