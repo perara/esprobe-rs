@@ -570,18 +570,22 @@ fn main() -> Result<()> {
         Action::Wifi(_) => unreachable!("wifi runs before any SWD configuration"),
         Action::PinMap => {
             let map = serial.command(Command::PinMap, &[])?;
-            // The first three are the debug port and are all a probe must have.
-            // A board that carries more than one — a UART to the target, a mux,
-            // a second radio — appends its own, and they are reported
-            // positionally rather than named, because only that firmware knows
-            // what they are. Reading a short response as a failure would refuse
-            // the minimal case this command exists to serve.
+            // The first three are the debug port and are all a probe must
+            // have; the next two are the optional UART to the target. A board
+            // that carries more than that — a mux, a second radio — appends its
+            // own, and they are reported positionally rather than named,
+            // because only that firmware knows what they are. A short response
+            // is read as a probe with fewer pins, not as a failure.
             let [swdio, swclk, reset, rest @ ..] = map.as_slice() else {
                 bail!("pin map returned {} bytes, wanted at least 3", map.len());
             };
             print!("SWDIO=GPIO{swdio} SWCLK=GPIO{swclk} RESET=GPIO{reset}");
+            const NAMED: [&str; 2] = ["UART_TX", "UART_RX"];
             for (index, pin) in rest.iter().enumerate() {
-                print!(" board{index}=GPIO{pin}");
+                match NAMED.get(index) {
+                    Some(name) => print!(" {name}=GPIO{pin}"),
+                    None => print!(" board{}=GPIO{pin}", index - NAMED.len()),
+                }
             }
             println!();
             return Ok(());

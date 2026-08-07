@@ -175,6 +175,43 @@ pub fn read_debug_port_id_once(
     Ok(DebugPortId::decode(raw))
 }
 
+/// Turns a bridge refusal into something that names the likely cause.
+///
+/// The status and its detail byte are exact, and were what this printed. They
+/// are also opaque unless you have the firmware open beside you — `Transport,
+/// detail=[04]` is the fail-closed power check refusing to drive a pad, which
+/// is a wiring or power problem and reads as an internal error. The raw values
+/// are kept on the end, because they are what a bug report needs.
+fn describe_failure(status: Status, detail: &[u8]) -> String {
+    let cause = match (status, detail.first()) {
+        (Status::Transport, Some(1)) => {
+            Some("the debug port returned an implausible IDCODE (all zeros or all ones)")
+        }
+        (Status::Transport, Some(2)) => Some("the debug port never reported powered-up"),
+        (Status::Transport, Some(3)) => Some("a memory access was not word-aligned"),
+        (Status::Transport, Some(4)) => Some(
+            "target power is unproven: SWDIO reads low when released, so the probe \
+             refused to drive a pad. Check target power, ground, and the SWDIO wire",
+        ),
+        // A three-bit SWD acknowledgement, shifted out LSB first. 0b111 is what
+        // an idle pull-up looks like when nothing is driving the line at all.
+        (Status::Transport, Some(7)) => Some(
+            "no response on the wire: nothing acknowledged the request. Check that a \
+             target is connected and powered",
+        ),
+        (Status::NotAttached, _) => Some("not attached; run a command that attaches first"),
+        (Status::TargetInReset, _) => {
+            Some("the target is held in reset, so its bus would answer zeros")
+        }
+        (Status::Unsupported, _) => Some("this firmware does not implement that command"),
+        _ => None,
+    };
+    match cause {
+        Some(cause) => format!("{cause} (bridge status {status:?}, detail={detail:02x?})"),
+        None => format!("bridge status {status:?}, detail={detail:02x?}"),
+    }
+}
+
 /// Reads target words over the bridge's bulk path.
 pub fn read_words(serial: &mut SerialDapProbe, address: u32, count: usize) -> Result<Vec<u32>> {
     let mut request = address.to_le_bytes().to_vec();
@@ -321,9 +358,7 @@ impl Transport {
                 );
                 return match response.status {
                     Status::Ok => Ok(response.payload.to_vec()),
-                    status => {
-                        bail!("bridge status {status:?}, detail={:02x?}", response.payload)
-                    }
+                    status => bail!("{}", describe_failure(status, response.payload)),
                 };
             }
             if Instant::now() >= deadline {
