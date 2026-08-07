@@ -1,4 +1,4 @@
-//! Hardware-neutral contracts for the ESP32-C3 SWD bridge.
+//! Hardware-neutral contracts for the ESP32 SWD bridge.
 //!
 //! This crate is the probe and nothing else: a debug port on two pins, a reset
 //! line, and an optional UART to whatever is on the other end. It knows no
@@ -9,6 +9,7 @@
 //! the range [`esprobe_protocol::frame::EXTENSION_BASE`] upward, and keeps its
 //! own pin assignment. Nothing here needs to know it exists.
 
+pub mod chip;
 pub mod safety;
 pub mod swd;
 
@@ -41,7 +42,7 @@ pub use esprobe_protocol::frame as usb_bridge;
 /// elsewhere overrides them at build time; a board that carries more pins than
 /// these declares its own map and does not extend this one.
 pub mod pinmap {
-    /// Parses a build-time pin override, rejecting anything the ESP32-C3 does
+    /// Parses a build-time pin override, rejecting anything this part does
     /// not have. `const` so a bad value fails the build rather than the board.
     const fn pin(override_value: Option<&str>, default: i32) -> i32 {
         let Some(text) = override_value else {
@@ -59,7 +60,10 @@ pub mod pinmap {
             number = number * 10 + (digit - b'0') as i32;
             index += 1;
         }
-        assert!(number <= 21, "the ESP32-C3 has no GPIO above 21");
+        assert!(
+            number <= crate::chip::MAX_GPIO,
+            "this part has no GPIO that high"
+        );
         number
     }
 
@@ -90,18 +94,17 @@ mod tests {
 
     #[test]
     fn no_claimed_pin_is_one_the_chip_cannot_give_us() {
-        // GPIO18 and GPIO19 are the USB D-/D+ pair this probe is reached over,
-        // and GPIO12..=17 are the SPI flash the firmware runs from. Driving any
-        // of them does not produce a signal, it produces a brick.
+        // Which pads those are is a fact about the part, so the ranges live
+        // in `chip` and this checks the map against whichever part is being
+        // built for.
         for pin in pinmap::CLAIMED {
             assert!(
-                !(18..=19).contains(&pin),
-                "GPIO{pin} is the USB pair this board is talked to over"
+                pin >= 0 && pin <= crate::chip::MAX_GPIO,
+                "GPIO{pin} does not exist"
             );
-            assert!(
-                !(12..=17).contains(&pin),
-                "GPIO{pin} belongs to the SPI flash"
-            );
+            for &(low, high, why) in crate::chip::RESERVED {
+                assert!(!(low..=high).contains(&pin), "GPIO{pin} belongs to {why}");
+            }
         }
     }
 

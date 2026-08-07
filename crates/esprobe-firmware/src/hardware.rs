@@ -23,7 +23,7 @@ use crate::swd::SwdIo;
 
 use crate::spi_wire::{MAX_BURST_BITS, SpiWire};
 
-const GPIO_BASE: u32 = 0x6000_4000;
+use crate::chip::GPIO_BASE;
 const GPIO_ENABLE_W1TS: u32 = 0x24;
 const GPIO_ENABLE_W1TC: u32 = 0x28;
 const GPIO_FUNC0_OUT_SEL_CFG: u32 = 0x554;

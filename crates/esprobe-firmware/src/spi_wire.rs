@@ -20,7 +20,7 @@ use esp_idf_svc::sys::{periph_module_enable, periph_module_t_PERIPH_SPI2_MODULE}
 
 use crate::spi_clock::{self, SOURCE_CLOCK_HZ};
 
-const SPI2_BASE: u32 = 0x6002_4000;
+use crate::chip::SPI2_BASE;
 const SPI_CMD: u32 = 0x00;
 const SPI_CTRL: u32 = 0x08;
 const SPI_CLOCK: u32 = 0x0c;
