@@ -29,10 +29,7 @@ const GPIO_ENABLE_W1TC: u32 = 0x28;
 const GPIO_FUNC0_OUT_SEL_CFG: u32 = 0x554;
 const GPIO_FUNC_OEN_SEL: u32 = 1 << 9;
 
-/// Dedicated-GPIO channel 0 carries SWDIO and channel 1 carries SWCLK,
-/// whichever pads they are routed to.
-const SWDIO_CHANNEL: u32 = 0b01;
-const SWCLK_CHANNEL: u32 = 0b10;
+use crate::pads::{ChipPads, Pads, SWCLK as SWCLK_CHANNEL, SWDIO as SWDIO_CHANNEL};
 
 const CPU_FREQ_HZ: u32 = esp_idf_svc::sys::CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ * 1_000_000;
 /// Fallback wire clock when GPSPI2 is not driving the pads.
@@ -116,6 +113,8 @@ pub struct EspSwdIo<'d> {
     schematic_swclk_pin: u32,
     swdio_pin: u32,
     swclk_pin: u32,
+    /// However this part drives and samples the two pads.
+    pads: ChipPads,
     spi: SpiWire,
     driver: Driver,
     engine: Engine,
@@ -144,6 +143,9 @@ impl<'d> EspSwdIo<'d> {
             schematic_swclk_pin: swclk_number,
             swdio_pin: swdio_number,
             swclk_pin: swclk_number,
+            // Built from the schematic pins; `set_pin_map` rebuilds it if a
+            // bench harness turns out to have them crossed.
+            pads: ChipPads::new(swdio_number as i32, swclk_number as i32),
             spi: SpiWire::new(DEFAULT_CLOCK_HZ),
             driver: Driver::DedicatedGpio,
             engine: Engine::Hardware,
@@ -166,6 +168,11 @@ impl<'d> EspSwdIo<'d> {
         };
         self.swdio_pin = swdio_pin;
         self.swclk_pin = swclk_pin;
+        // The pad layer addresses by pin on parts without dedicated GPIO, so a
+        // remap has to reach it too. Rebuilt rather than mutated, for the same
+        // reason the pins are derived from the schematic above: repeating the
+        // request must land in the same place, not toggle.
+        self.pads = ChipPads::new(swdio_pin as i32, swclk_pin as i32);
 
         // Inputs feed both engines at once: a pad's level can fan out to any
         // number of peripheral input signals.
@@ -228,18 +235,6 @@ impl<'d> EspSwdIo<'d> {
         }
     }
 
-    /// Drives both dedicated-GPIO channels in one instruction.
-    ///
-    /// SWDIO and SWCLK are channels 0 and 1 of the same CSR, so a whole edge —
-    /// new data level and new clock level together — is one write rather than
-    /// a pair of read-modify-writes. No other channel is routed to a pad, so
-    /// writing the register wholesale is safe.
-    #[inline(always)]
-    fn drive_channels(levels: u32) {
-        // SAFETY: 0x805 is CSR_GPIO_OUT_USER on ESP32-C3.
-        unsafe { core::arch::asm!("csrw 0x805, {levels}", levels = in(reg) levels) };
-    }
-
     /// Times the bit-bang loop against the cycle counter with both pads
     /// released, so the rate reported to the host is measured rather than
     /// assumed. Nothing is driven: output enable is cleared first.
@@ -264,13 +259,13 @@ impl<'d> EspSwdIo<'d> {
             // The data level is presented with SWCLK already low, so it is
             // stable across the low phase and over the rising edge the target
             // samples on.
-            Self::drive_channels(data);
+            self.pads.drive(data);
             self.delay_cycles(half);
-            Self::drive_channels(data | SWCLK_CHANNEL);
+            self.pads.drive(data | SWCLK_CHANNEL);
             self.delay_cycles(half);
         }
         // Leave the line high, which is the idle state callers expect.
-        Self::drive_channels(SWDIO_CHANNEL | SWCLK_CHANNEL);
+        self.pads.drive(SWDIO_CHANNEL | SWCLK_CHANNEL);
     }
 
     /// Samples late in the low phase, matching the engine this port replaced.
@@ -279,12 +274,12 @@ impl<'d> EspSwdIo<'d> {
         let half = self.half_cycle_cycles;
         let mut value = 0;
         for index in 0..count {
-            Self::drive_channels(0);
+            self.pads.drive(0);
             self.delay_cycles(half);
-            if Self::pad_levels() & SWDIO_CHANNEL != 0 {
+            if self.pads.levels() & SWDIO_CHANNEL != 0 {
                 value |= 1 << index;
             }
-            Self::drive_channels(SWCLK_CHANNEL);
+            self.pads.drive(SWCLK_CHANNEL);
             self.delay_cycles(half);
         }
         value
@@ -302,14 +297,14 @@ impl<'d> EspSwdIo<'d> {
             Driver::Spi => {
                 // GPSPI2 idles SWCLK low; match that before the handover so the
                 // pad holds one level right across it.
-                Self::latch_level(SWCLK_CHANNEL, false);
+                self.pads.latch(SWCLK_CHANNEL, false);
                 route_output(self.swdio_pin, FSPID_OUT_IDX);
                 route_output(self.swclk_pin, FSPICLK_OUT_IDX);
             }
             Driver::DedicatedGpio => {
-                let levels = Self::pad_levels();
-                Self::latch_level(SWDIO_CHANNEL, levels & SWDIO_CHANNEL != 0);
-                Self::latch_level(SWCLK_CHANNEL, levels & SWCLK_CHANNEL != 0);
+                let levels = self.pads.levels();
+                self.pads.latch(SWDIO_CHANNEL, levels & SWDIO_CHANNEL != 0);
+                self.pads.latch(SWCLK_CHANNEL, levels & SWCLK_CHANNEL != 0);
                 route_output(self.swdio_pin, CPU_GPIO_OUT0_IDX);
                 route_output(self.swclk_pin, CPU_GPIO_OUT1_IDX);
             }
@@ -365,24 +360,6 @@ impl<'d> EspSwdIo<'d> {
         gpio_write(GPIO_ENABLE_W1TC, clear);
     }
 
-    fn latch_level(channel: u32, high: bool) {
-        if high {
-            // SAFETY: 0x805 is CSR_GPIO_OUT_USER on ESP32-C3.
-            unsafe { core::arch::asm!("csrrs zero, 0x805, {mask}", mask = in(reg) channel) };
-        } else {
-            // SAFETY: 0x805 is CSR_GPIO_OUT_USER on ESP32-C3.
-            unsafe { core::arch::asm!("csrrc zero, 0x805, {mask}", mask = in(reg) channel) };
-        }
-    }
-
-    /// Samples both pads through the dedicated-GPIO input channels.
-    fn pad_levels() -> u32 {
-        let value: u32;
-        // SAFETY: 0x804 is CSR_GPIO_IN_USER on ESP32-C3.
-        unsafe { core::arch::asm!("csrr {value}, 0x804", value = out(reg) value) };
-        value
-    }
-
     #[inline(always)]
     fn delay_cycles(&self, cycles: u32) {
         if cycles <= MIN_DELAY_CYCLES {
@@ -408,16 +385,16 @@ impl SwdIo for EspSwdIo<'_> {
 
     fn write_swdio(&mut self, high: bool) {
         self.select_driver(Driver::DedicatedGpio);
-        Self::latch_level(SWDIO_CHANNEL, high);
+        self.pads.latch(SWDIO_CHANNEL, high);
     }
 
     fn read_swdio(&mut self) -> bool {
-        Self::pad_levels() & SWDIO_CHANNEL != 0
+        self.pads.levels() & SWDIO_CHANNEL != 0
     }
 
     fn write_swclk(&mut self, high: bool) {
         self.select_driver(Driver::DedicatedGpio);
-        Self::latch_level(SWCLK_CHANNEL, high);
+        self.pads.latch(SWCLK_CHANNEL, high);
     }
 
     fn write_bits(&mut self, bits: u64, count: u8) {
@@ -570,12 +547,12 @@ impl SwdIo for EspSwdIo<'_> {
         self.select_driver(Driver::DedicatedGpio);
         // Preload high so the next enabled transition does not start from a
         // level that was only ever an artefact of the released bus.
-        Self::latch_level(SWDIO_CHANNEL, true);
-        Self::latch_level(SWCLK_CHANNEL, true);
+        self.pads.latch(SWDIO_CHANNEL, true);
+        self.pads.latch(SWCLK_CHANNEL, true);
     }
 
     fn sample_lines(&mut self) -> (bool, bool) {
-        let levels = Self::pad_levels();
+        let levels = self.pads.levels();
         (levels & SWDIO_CHANNEL != 0, levels & SWCLK_CHANNEL != 0)
     }
 

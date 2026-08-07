@@ -19,6 +19,8 @@ pub mod swd;
 /// In the library rather than beside the binary so a board that is more than a
 /// probe can drive the same engine without forking it. Only builds for the
 /// target — there is no GPSPI2 on a host.
+pub mod pads;
+
 #[cfg(target_os = "espidf")]
 pub mod hardware;
 #[cfg(target_os = "espidf")]
