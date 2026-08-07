@@ -189,9 +189,12 @@ fn describe_failure(status: Status, detail: &[u8]) -> String {
         }
         (Status::Transport, Some(2)) => Some("the debug port never reported powered-up"),
         (Status::Transport, Some(3)) => Some("a memory access was not word-aligned"),
+        // Both the attach path and the fail-closed power check report this,
+        // and they mean the same thing: nothing is holding SWDIO up, so there
+        // is no evidence a powered target is on the other end.
         (Status::Transport, Some(4)) => Some(
-            "target power is unproven: SWDIO reads low when released, so the probe \
-             refused to drive a pad. Check target power, ground, and the SWDIO wire",
+            "SWDIO reads low when released, so no powered target is presenting its \
+             pull-up. Check target power, ground, and the SWDIO wire",
         ),
         // A three-bit SWD acknowledgement, shifted out LSB first. 0b111 is what
         // an idle pull-up looks like when nothing is driving the line at all.
