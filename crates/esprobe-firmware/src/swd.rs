@@ -332,8 +332,13 @@ impl<I: SwdIo> SwdLink<I> {
         })
     }
 
-    /// Drive PA14/SWCLK as BOOT0 while the target is held in reset.
-    pub fn diagnostic_drive_boot0(&mut self, high: bool) {
+    /// Hold SWCLK at a fixed level while the target is held in reset.
+    ///
+    /// A pad-level primitive, not a debug operation: the clock pin doubles as a
+    /// strapping input on some parts, so holding it across a reset is how a
+    /// board selects an alternate boot source. Which level means what, and
+    /// whether the part honours it at all, is the target's business.
+    pub fn diagnostic_hold_swclk(&mut self, high: bool) {
         self.io.transaction(|io| {
             io.set_swdio_input();
             io.write_swclk(high);

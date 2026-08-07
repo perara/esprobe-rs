@@ -1,6 +1,6 @@
 //! Framing contract for the USB-serial ARM DAP bridge.
 
-pub const VERSION: u8 = 5;
+pub const VERSION: u8 = 6;
 /// Large enough for a 256-word block read plus the envelope and worst-case
 /// COBS overhead. One USB round trip per kibibyte, rather than per word, is
 /// what keeps the wire — not the transport — the limiting factor.
@@ -10,6 +10,18 @@ pub const MAX_FRAME: usize = 4136;
 pub const MAX_BLOCK_WORDS: usize = 1024;
 const REQUEST_MAGIC: &[u8; 4] = b"ESPB";
 const RESPONSE_MAGIC: &[u8; 4] = b"ESPR";
+
+/// First opcode a downstream product may define for itself.
+///
+/// Everything below this belongs to the probe and may gain new commands in any
+/// release; everything from here up is left alone, so a board that carries more
+/// than a debug port — a mux, a motor, a second radio — can put its own
+/// commands on the same wire without waiting for this crate to bless them, and
+/// without a future probe command landing on the number it chose.
+pub const EXTENSION_BASE: u8 = 0x80;
+/// Last opcode available to a downstream product. `0xff` is reserved so the
+/// range has room to grow a discovery command later.
+pub const EXTENSION_LAST: u8 = 0xfe;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FrameError;
@@ -31,12 +43,8 @@ pub enum Command {
     PadSelfTest = 0x18,
     RecoveryProbe = 0x19,
     DiagnosticSwdio = 0x1a,
-    /// Speak the STM32 system-memory bootloader's autobaud handshake (AN3155):
-    /// switch the display UART to 8E1, send 0x7F, report the reply, restore 8N1.
-    RomSync = 0x1b,
     UartReceive = 0x1c,
     UartResetCapture = 0x1d,
-    MuxProbe = 0x1e,
     ReadRegisterBlock = 0x1f,
     SetSpeed = 0x20,
     SetPinMap = 0x21,
@@ -56,9 +64,73 @@ pub enum Command {
     WifiSet = 0x2f,
     WifiForget = 0x30,
     UartSend = 0x31,
-    /// Reset the target with BOOT0 asserted, the hardware route into system
-    /// memory. Whether the pin is honoured is an option-byte decision.
-    Boot0Entry = 0x32,
+    /// An opcode this crate does not define, carried for a downstream product.
+    ///
+    /// Decoding one is not an error: a firmware built on this bridge is
+    /// expected to answer commands the bridge itself knows nothing about, and
+    /// the framing has already been validated by the time this is produced. A
+    /// firmware with no extensions of its own answers [`Status::Unsupported`],
+    /// which is what an unknown opcode meant before the range existed.
+    Extension(u8) = EXTENSION_BASE,
+}
+
+impl Command {
+    /// The byte this command occupies on the wire.
+    ///
+    /// A method rather than an `as` cast: the extension variant carries its
+    /// opcode as data, and a cast would silently produce the tag instead.
+    #[must_use]
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Hello => 0x01,
+            Self::Attach => 0x02,
+            Self::Detach => 0x03,
+            Self::ReadRegister => 0x10,
+            Self::WriteRegister => 0x11,
+            Self::SwjSequence => 0x12,
+            Self::LineState => 0x13,
+            Self::ResetLineState => 0x14,
+            Self::ResetAssert => 0x15,
+            Self::ResetRelease => 0x16,
+            Self::AttachUnderReset => 0x17,
+            Self::PadSelfTest => 0x18,
+            Self::RecoveryProbe => 0x19,
+            Self::DiagnosticSwdio => 0x1a,
+            Self::UartReceive => 0x1c,
+            Self::UartResetCapture => 0x1d,
+            Self::ReadRegisterBlock => 0x1f,
+            Self::SetSpeed => 0x20,
+            Self::SetPinMap => 0x21,
+            Self::Capabilities => 0x22,
+            Self::WriteRegisterBlock => 0x23,
+            Self::RecoverLine => 0x24,
+            Self::WireProbe => 0x25,
+            Self::SetEngine => 0x26,
+            Self::ApWriteProbe => 0x27,
+            Self::SpiLoopback => 0x28,
+            Self::MemoryRead => 0x29,
+            Self::Ping => 0x2a,
+            Self::Profile => 0x2b,
+            Self::Echo => 0x2c,
+            Self::PinMap => 0x2d,
+            Self::WifiStatus => 0x2e,
+            Self::WifiSet => 0x2f,
+            Self::WifiForget => 0x30,
+            Self::UartSend => 0x31,
+            Self::Extension(code) => code,
+        }
+    }
+
+    /// Builds an extension command, rejecting anything outside the reserved
+    /// range so a product cannot quietly claim a number the probe still owns.
+    #[must_use]
+    pub const fn extension(code: u8) -> Option<Self> {
+        if code >= EXTENSION_BASE && code <= EXTENSION_LAST {
+            Some(Self::Extension(code))
+        } else {
+            None
+        }
+    }
 }
 
 impl TryFrom<u8> for Command {
@@ -80,12 +152,9 @@ impl TryFrom<u8> for Command {
             0x18 => Ok(Self::PadSelfTest),
             0x19 => Ok(Self::RecoveryProbe),
             0x1a => Ok(Self::DiagnosticSwdio),
-            0x1b => Ok(Self::RomSync),
             0x1c => Ok(Self::UartReceive),
             0x31 => Ok(Self::UartSend),
-            0x32 => Ok(Self::Boot0Entry),
             0x1d => Ok(Self::UartResetCapture),
-            0x1e => Ok(Self::MuxProbe),
             0x1f => Ok(Self::ReadRegisterBlock),
             0x20 => Ok(Self::SetSpeed),
             0x21 => Ok(Self::SetPinMap),
@@ -104,6 +173,7 @@ impl TryFrom<u8> for Command {
             0x2e => Ok(Self::WifiStatus),
             0x2f => Ok(Self::WifiSet),
             0x30 => Ok(Self::WifiForget),
+            EXTENSION_BASE..=EXTENSION_LAST => Ok(Self::Extension(value)),
             _ => Err(FrameError),
         }
     }
@@ -143,7 +213,7 @@ pub fn encode_request(
     payload: &[u8],
     output: &mut [u8],
 ) -> Result<usize, FrameError> {
-    encode(REQUEST_MAGIC, sequence, command as u8, payload, output)
+    encode(REQUEST_MAGIC, sequence, command.code(), payload, output)
 }
 
 pub fn encode_response(
@@ -333,7 +403,7 @@ mod tests {
         let length = encode_request(0x1234, Command::Hello, &[], &mut frame).unwrap();
         assert_eq!(
             &frame[..length],
-            &[11, b'E', b'S', b'P', b'B', 5, 0x34, 0x12, 1, 0x2a, 0x48, 0],
+            &[11, b'E', b'S', b'P', b'B', 6, 0x34, 0x12, 1, 0xf6, 0xd3, 0],
             "the Hello request encoding moved"
         );
 
@@ -343,19 +413,19 @@ mod tests {
         assert_eq!(
             &frame[..length],
             &[
-                8, b'E', b'S', b'P', b'R', 5, 0x34, 0x12, 5, 0xde, 0xad, 0x69, 0x53, 0
+                8, b'E', b'S', b'P', b'R', 6, 0x34, 0x12, 5, 0xde, 0xad, 0x89, 0x9d, 0
             ],
             "the response encoding moved"
         );
 
         // Command numbers are part of the contract; renumbering one silently
         // repoints every host that has not been rebuilt.
-        assert_eq!(Command::Hello as u8, 0x01);
-        assert_eq!(Command::ReadRegister as u8, 0x10);
-        assert_eq!(Command::MemoryRead as u8, 0x29);
+        assert_eq!(Command::Hello.code(), 0x01);
+        assert_eq!(Command::ReadRegister.code(), 0x10);
+        assert_eq!(Command::MemoryRead.code(), 0x29);
         assert_eq!(Status::TargetInReset as u8, 8);
-        assert_eq!(Command::UartSend as u8, 0x31);
-        assert_eq!(VERSION, 5);
+        assert_eq!(Command::UartSend.code(), 0x31);
+        assert_eq!(VERSION, 6);
     }
 
     #[test]
@@ -372,7 +442,7 @@ mod tests {
     #[test]
     fn reset_line_state_has_a_stable_wire_command() {
         assert_eq!(Command::try_from(0x14), Ok(Command::ResetLineState));
-        assert_eq!(Command::ResetLineState as u8, 0x14);
+        assert_eq!(Command::ResetLineState.code(), 0x14);
     }
 
     #[test]
@@ -383,11 +453,9 @@ mod tests {
         assert_eq!(Command::try_from(0x18), Ok(Command::PadSelfTest));
         assert_eq!(Command::try_from(0x19), Ok(Command::RecoveryProbe));
         assert_eq!(Command::try_from(0x1a), Ok(Command::DiagnosticSwdio));
-        assert_eq!(Command::try_from(0x1b), Ok(Command::RomSync));
         assert_eq!(Command::try_from(0x1c), Ok(Command::UartReceive));
         assert_eq!(Command::try_from(0x31), Ok(Command::UartSend));
         assert_eq!(Command::try_from(0x1d), Ok(Command::UartResetCapture));
-        assert_eq!(Command::try_from(0x1e), Ok(Command::MuxProbe));
         assert_eq!(Command::try_from(0x1f), Ok(Command::ReadRegisterBlock));
         assert_eq!(Command::try_from(0x20), Ok(Command::SetSpeed));
         assert_eq!(Command::try_from(0x21), Ok(Command::SetPinMap));
@@ -406,6 +474,57 @@ mod tests {
         assert_eq!(Command::try_from(0x2e), Ok(Command::WifiStatus));
         assert_eq!(Command::try_from(0x2f), Ok(Command::WifiSet));
         assert_eq!(Command::try_from(0x30), Ok(Command::WifiForget));
+    }
+
+    #[test]
+    fn opcodes_that_left_with_a_vendor_are_not_reissued() {
+        // These three were a board and a chip family, not a debug port:
+        //   0x1b `RomSync`     - one vendor's system-memory bootloader
+        //   0x1e `MuxProbe`    - an analog switch on one particular board
+        //   0x32 `Boot0Entry`  - the same vendor's boot-strapping pin
+        // They moved out to the products that own them, and the numbers stay
+        // retired: a deployed host built against version 5 still speaks them,
+        // and handing one to a new probe command would make that host drive
+        // something else entirely.
+        for retired in [0x1b, 0x1e, 0x32] {
+            assert_eq!(
+                Command::try_from(retired),
+                Err(FrameError),
+                "opcode 0x{retired:02x} was reissued"
+            );
+        }
+    }
+
+    #[test]
+    fn a_product_can_define_commands_the_probe_does_not_know() {
+        let mux = Command::extension(0x80).expect("0x80 is inside the range");
+        assert_eq!(Command::try_from(0x80), Ok(mux));
+        assert_eq!(mux.code(), 0x80);
+        assert_eq!(
+            Command::try_from(EXTENSION_LAST),
+            Ok(Command::Extension(0xfe))
+        );
+
+        // The tag of the extension variant must not leak out in place of the
+        // opcode; that is the whole reason `code()` exists rather than a cast.
+        assert_eq!(Command::Extension(0xa7).code(), 0xa7);
+    }
+
+    #[test]
+    fn a_product_cannot_claim_a_number_the_probe_still_owns() {
+        assert_eq!(Command::extension(0x10), None, "ReadRegister is not free");
+        assert_eq!(Command::extension(0x7f), None, "below the reserved range");
+        assert_eq!(Command::extension(0xff), None, "held back for discovery");
+    }
+
+    #[test]
+    fn an_extension_command_survives_the_round_trip() {
+        let mut frame = [0u8; MAX_FRAME + 2];
+        let mux = Command::extension(0x81).unwrap();
+        let length = encode_request(4, mux, &[2], &mut frame).unwrap();
+        let request = decode_request(&mut frame[..length - 1]).unwrap();
+        assert_eq!(request.command, mux);
+        assert_eq!(request.payload, [2]);
     }
 
     #[test]

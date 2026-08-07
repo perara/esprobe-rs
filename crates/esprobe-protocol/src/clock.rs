@@ -6,11 +6,14 @@
 
 /// GPSPI2's master clock source with `mst_clk_sel` set to PLL_F80M.
 pub const SOURCE_CLOCK_HZ: u32 = 80_000_000;
-/// Above this the analog switch mux path and flying bench leads stop being trustworthy.
+/// Above this, flying bench leads stop being trustworthy. A board that puts an
+/// analog switch or a long harness between the probe and the target is slower
+/// still, and should ask for a lower clock rather than raise this.
 pub const MAX_CLOCK_HZ: u32 = 20_000_000;
 pub const MIN_CLOCK_HZ: u32 = 100_000;
-/// Fast enough that the transport, not the wire, is the limit, and still
-/// inside what the mux and unshielded bench leads carry reliably.
+/// Fast enough that the transport, not the wire, is the limit, and still inside
+/// what unshielded bench leads carry reliably. Direct-wired to a devkit there is
+/// headroom above this; through anything longer there may not be.
 pub const DEFAULT_CLOCK_HZ: u32 = 8_000_000;
 
 /// A programmed `SPI_CLOCK` value and the SWCLK frequency it produces.

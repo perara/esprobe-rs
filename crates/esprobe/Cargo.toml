@@ -24,7 +24,7 @@ path = "src/main.rs"
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 ctrlc = "3.4"
-esprobe-protocol = { path = "../esprobe-protocol", version = "0.1.0" }
+esprobe-protocol = { path = "../esprobe-protocol", version = "0.2.0" }
 probe-rs = "0.31"
 serialport = { version = "4.8", default-features = false }
 rpassword = "7.3"

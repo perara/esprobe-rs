@@ -3,7 +3,7 @@
 //! Two engines share the same two pads. GPSPI2 shifts every field that belongs
 //! to a transfer, because hardware-generated SWCLK is both far faster and
 //! immune to scheduler jitter. The dedicated-GPIO path stays for the pad-level
-//! diagnostics — continuity checks, BOOT0 forcing, released-line sampling —
+//! diagnostics — continuity checks, strap forcing, released-line sampling —
 //! where the point is to hold a level rather than clock a field.
 //!
 //! Both engines drive the pad through the GPIO matrix, so switching between
@@ -18,8 +18,8 @@ use esp_idf_svc::sys::{
     FSPID_OUT_IDX, FSPIQ_IN_IDX, esp_rom_gpio_connect_in_signal,
 };
 
-use esprobe_firmware::spi_clock::DEFAULT_CLOCK_HZ;
-use esprobe_firmware::swd::SwdIo;
+use crate::spi_clock::DEFAULT_CLOCK_HZ;
+use crate::swd::SwdIo;
 
 use crate::spi_wire::{MAX_BURST_BITS, SpiWire};
 

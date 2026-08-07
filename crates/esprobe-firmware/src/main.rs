@@ -6,16 +6,6 @@ fn main() {
 }
 
 #[cfg(target_os = "espidf")]
-mod hardware;
-
-#[cfg(target_os = "espidf")]
-mod spi_wire;
-
-#[cfg(target_os = "espidf")]
-mod actuator_hw;
-mod ws_link;
-
-#[cfg(target_os = "espidf")]
 mod app {
     use std::sync::{Arc, Mutex};
     use std::thread;
@@ -49,15 +39,14 @@ mod app {
     use log::{error, info, warn};
 
     use esprobe_firmware::safety::ReleasedSwdState;
-    use esprobe_firmware::stm32g0::{Error as StmError, FLASH_BYTES, Stm32G030};
     use esprobe_firmware::swd::{Error as SwdError, SwdLink, WordMemory};
     use esprobe_firmware::usb_bridge::{
         Command as BridgeCommand, MAX_BLOCK_WORDS, MAX_FRAME as BRIDGE_MAX_FRAME,
         Status as BridgeStatus, decode_request, encode_response,
     };
-    use esprobe_firmware::{ProgrammingTarget, pinmap, wifi_credentials};
+    use esprobe_firmware::{pinmap, wifi_credentials};
 
-    use crate::hardware::{Engine, EspSwdIo, cpu_cycles};
+    use esprobe_firmware::hardware::{Engine, EspSwdIo, cpu_cycles};
 
     // Build-time credentials are a convenience for a bench that always joins
     // the same network, not a requirement: an image with none still builds,
@@ -107,19 +96,21 @@ mod app {
     }
 
     struct Hub {
-        asw_s0: PinDriver<'static, InputOutput>,
-        asw_s1: PinDriver<'static, InputOutput>,
-        reset_all: PinDriver<'static, InputOutput>,
-        display: UartDriver<'static>,
+        reset: PinDriver<'static, InputOutput>,
+        /// An optional serial link to the target, for a console or a vendor's
+        /// ROM bootloader. The probe passes bytes both ways and does not read
+        /// them — what they mean is the target's business, and knowing would
+        /// make this firmware care which chip it is talking to.
+        uart: UartDriver<'static>,
         swd: Option<SwdLink<EspSwdIo<'static>>>,
-        selected: ProgrammingTarget,
         wifi: Arc<Mutex<WifiControl>>,
         bridge_attached: bool,
         /// Whether *this* firmware is holding the shared reset line down.
         ///
-        /// Tracked as intent rather than sampled from the pad: on the STM32G0
-        /// NRST is bidirectional, so the target pulls it low during its own
-        /// resets — including the ones probe-rs performs while flashing — and a
+        /// Tracked as intent rather than sampled from the pad: reset is
+        /// bidirectional on many parts, so the target pulls it low during its
+        /// own resets — including the ones probe-rs performs while flashing —
+        /// and a
         /// guard that reads the pin cannot tell that apart from a command that
         /// left reset asserted.
         reset_held: bool,
@@ -129,10 +120,10 @@ mod app {
         /// Drives or releases the shared reset line, recording which it is.
         fn hold_reset(&mut self, held: bool) -> Result<()> {
             if held {
-                self.reset_all.set_low()?;
+                self.reset.set_low()?;
             }
             Self::set_gpio_direction(
-                pinmap::RESET_ALL,
+                pinmap::RESET,
                 if held {
                     gpio_mode_t_GPIO_MODE_OUTPUT
                 } else {
@@ -150,12 +141,12 @@ mod app {
             Ok(())
         }
 
-        /// Route UART1's transmitter onto `DISP_TX` and enable the driver.
+        /// Route UART1's transmitter onto `UART_TX` and enable the driver.
         ///
         /// Idempotent, and cheap enough to call before every write. Nothing
         /// ever releases this pad now - see the constructor for why the old
         /// release-and-redrive dance silently stopped the port transmitting.
-        fn bind_disp_tx() -> Result<()> {
+        fn bind_uart_pins() -> Result<()> {
             // SAFETY: the pin belongs to this driver and the port is open.
             esp_idf_svc::sys::esp!(unsafe {
                 // Both pins, not just the transmitter. `uart_set_pin` with
@@ -166,8 +157,8 @@ mod app {
                 // nothing on a call that already runs once per command.
                 uart_set_pin(
                     uart_port_t_UART_NUM_1,
-                    pinmap::DISP_TX,
-                    pinmap::DISP_RX,
+                    pinmap::UART_TX,
+                    pinmap::UART_RX,
                     UART_PIN_NO_CHANGE,
                     UART_PIN_NO_CHANGE,
                 )
@@ -183,28 +174,28 @@ mod app {
             Ok(())
         }
 
-        fn select_stm32_passively(&mut self) -> Result<()> {
+        /// Drop the debug link and leave both pads released.
+        ///
+        /// Every command that is about to drive the pads starts here, so the
+        /// state they are driven from is always the same one.
+        fn release_pads(&mut self) -> Result<()> {
             if let Some(swd) = self.swd.as_mut() {
                 swd.disconnect();
             }
-            // The only selector state that never drives a high level.
-            self.asw_s0.set_low()?;
-            self.asw_s1.set_low()?;
             thread::sleep(Duration::from_millis(5));
-            self.selected = ProgrammingTarget::Stm32;
             self.bridge_attached = false;
             Ok(())
         }
 
         fn require_target_power(&mut self) -> Result<()> {
-            self.select_stm32_passively()?;
+            self.release_pads()?;
             let (mut swdio, mut swclk) = self
                 .swd
                 .as_mut()
                 .context("SWD engine unavailable")?
                 .released_line_state();
-            if !swdio && self.reset_all.is_high() {
-                self.pulse_reset_all_low_release()?;
+            if !swdio && self.reset.is_high() {
+                self.pulse_reset_low_release()?;
                 (swdio, swclk) = self
                     .swd
                     .as_mut()
@@ -213,31 +204,12 @@ mod app {
             }
             anyhow::ensure!(
                 ReleasedSwdState::from_levels(swdio, swclk).permits_high_drive(),
-                "target power not proven: released STM32 SWDIO is low (SWCLK={swclk})"
+                "target power not proven: released SWDIO is low (SWCLK={swclk})"
             );
             Ok(())
         }
 
-        fn select(&mut self, target: ProgrammingTarget) -> Result<()> {
-            self.require_target_power()?;
-            let (s0, s1) = target.selector();
-            if s0 {
-                self.asw_s0.set_high()?;
-            } else {
-                self.asw_s0.set_low()?;
-            }
-            if s1 {
-                self.asw_s1.set_high()?;
-            } else {
-                self.asw_s1.set_low()?;
-            }
-            thread::sleep(Duration::from_millis(5));
-            self.selected = target;
-            self.bridge_attached = false;
-            Ok(())
-        }
-
-        fn pulse_reset_all_low_release(&mut self) -> Result<()> {
+        fn pulse_reset_low_release(&mut self) -> Result<()> {
             self.hold_reset(true)?;
             thread::sleep(Duration::from_millis(10));
             self.hold_reset(false)?;
@@ -245,55 +217,13 @@ mod app {
             Ok(())
         }
 
-        fn pulse_reset_all(&mut self) -> Result<()> {
+        fn pulse_reset(&mut self) -> Result<()> {
             anyhow::ensure!(
-                self.reset_all.is_high(),
-                "carrier board reset pull-up is not visible"
+                self.reset.is_high(),
+                "the target's reset pull-up is not visible"
             );
-            self.pulse_reset_all_low_release()?;
+            self.pulse_reset_low_release()?;
             Ok(())
-        }
-
-        fn probe_stm32(&mut self) -> Result<(u32, u32)> {
-            self.select(ProgrammingTarget::Stm32)?;
-            let swd = self.swd.as_mut().context("SWD engine unavailable")?;
-            let result = (|| {
-                let dp_id = swd.initialize().map_err(|error| anyhow!("{error:?}"))?;
-                let device_id = Stm32G030::new(swd)
-                    .identify()
-                    .map_err(|error| anyhow!("{error:?}"))?;
-                Ok((dp_id, device_id))
-            })();
-            swd.disconnect();
-            result
-        }
-
-        fn flash_stm32(&mut self, image: &[u8]) -> Result<(u32, u32)> {
-            self.select(ProgrammingTarget::Stm32)?;
-            let swd = self.swd.as_mut().context("SWD engine unavailable")?;
-            let result = (|| {
-                let dp_id = swd.initialize().map_err(|error| anyhow!("{error:?}"))?;
-                let mut target = Stm32G030::new(swd);
-                let device_id = target
-                    .program_and_verify(image)
-                    .map_err(|error| anyhow!("{error:?}"))?;
-                target.reset().map_err(|error| anyhow!("{error:?}"))?;
-                Ok((dp_id, device_id))
-            })();
-            swd.disconnect();
-            result
-        }
-
-        fn write_display(&mut self, frame: &[u8]) -> Result<usize> {
-            self.require_target_power()?;
-            Self::bind_disp_tx()?;
-            let result = (|| {
-                let written = self.display.write(frame)?;
-                self.display.wait_tx_done(100)?;
-                Ok(written)
-            })();
-            // DISP_TX stays bound; see the constructor.
-            result
         }
 
         fn bridge_command(
@@ -329,6 +259,15 @@ mod app {
             if reads_target_memory && self.reset_held {
                 return (BridgeStatus::TargetInReset, 0);
             }
+            // A command belonging to whatever board this firmware was built
+            // into. A bare probe is not built into one, so there is nothing to
+            // dispatch to — and the honest answer is the one an unknown opcode
+            // always got. Answered here rather than refused at decode time: the
+            // framing was valid, so the host gets a status it can act on
+            // instead of a dropped frame it has to time out.
+            if matches!(command, BridgeCommand::Extension(_)) {
+                return (BridgeStatus::Unsupported, 0);
+            }
             match self.try_bridge_command(command, payload, response) {
                 Ok(length) => (BridgeStatus::Ok, length),
                 Err(SwdError::WaitTimeout) => (BridgeStatus::Wait, 0),
@@ -363,15 +302,15 @@ mod app {
                     Ok(4)
                 }
                 BridgeCommand::Attach => {
-                    self.select_stm32_passively()
+                    self.release_pads()
                         .map_err(|_| SwdError::Protocol(0))?;
                     let (mut swdio, _) = self
                         .swd
                         .as_mut()
                         .ok_or(SwdError::Protocol(0))?
                         .released_line_state();
-                    if !swdio && self.reset_all.is_high() {
-                        self.pulse_reset_all_low_release()
+                    if !swdio && self.reset.is_high() {
+                        self.pulse_reset_low_release()
                             .map_err(|_| SwdError::Protocol(0))?;
                         (swdio, _) = self
                             .swd
@@ -398,12 +337,12 @@ mod app {
                     Ok(0)
                 }
                 BridgeCommand::AttachUnderReset => {
-                    self.select_stm32_passively()
+                    self.release_pads()
                         .map_err(|_| SwdError::Protocol(0))?;
                     if self.swd.is_none() {
                         return Err(SwdError::Protocol(0));
                     }
-                    self.reset_all
+                    self.reset
                         .set_low()
                         .map_err(|_| SwdError::Protocol(0))?;
                     self.hold_reset(true).map_err(|_| SwdError::Protocol(0))?;
@@ -422,12 +361,12 @@ mod app {
                     Ok(0)
                 }
                 BridgeCommand::PadSelfTest => {
-                    self.select_stm32_passively()
+                    self.release_pads()
                         .map_err(|_| SwdError::Protocol(0))?;
                     if self.swd.is_none() {
                         return Err(SwdError::Protocol(0));
                     }
-                    self.reset_all
+                    self.reset
                         .set_low()
                         .map_err(|_| SwdError::Protocol(0))?;
                     self.hold_reset(true).map_err(|_| SwdError::Protocol(0))?;
@@ -448,7 +387,7 @@ mod app {
                         [low, high] => u16::from_le_bytes([*low, *high]),
                         _ => return Err(SwdError::Protocol(0)),
                     };
-                    self.select_stm32_passively()
+                    self.release_pads()
                         .map_err(|_| SwdError::Protocol(0))?;
                     if self.swd.is_none() {
                         return Err(SwdError::Protocol(0));
@@ -460,7 +399,7 @@ mod app {
                     // every later read returns zeros and looks like a blank
                     // device rather than an error.
                     let outcome = (|| {
-                        self.reset_all
+                        self.reset
                             .set_low()
                             .map_err(|_| SwdError::Protocol(0))?;
                         self.hold_reset(true).map_err(|_| SwdError::Protocol(0))?;
@@ -475,39 +414,29 @@ mod app {
                         self.hold_reset(false).map_err(|_| SwdError::Protocol(0))?;
                         Ets::delay_us(u32::from(delay_us));
                         let swd = self.swd.as_mut().ok_or(SwdError::Protocol(0))?;
-                        let dp_id = swd.initialize_prepared()?;
-                        let mut target = Stm32G030::new(swd);
-                        target.halt().map_err(|error| match error {
-                            StmError::Transport(error) => error,
-                            _ => SwdError::Protocol(0),
-                        })?;
-                        let device_id = target.identify().map_err(|error| match error {
-                            StmError::Transport(error) => error,
-                            _ => SwdError::Protocol(0),
-                        })?;
-                        target.reset().map_err(|error| match error {
-                            StmError::Transport(error) => error,
-                            _ => SwdError::Protocol(0),
-                        })?;
-                        Ok((dp_id, device_id))
+                        // The debug port answering inside the reset-release
+                        // window is the whole result. What the part *is* takes
+                        // a vendor register this firmware deliberately does not
+                        // know; probe-rs reads that over the same link once the
+                        // host has attached.
+                        swd.initialize_prepared()
                     })();
                     let _ = self.hold_reset(false);
                     if let Some(swd) = self.swd.as_mut() {
                         swd.disconnect();
                     }
                     self.bridge_attached = false;
-                    let (dp_id, device_id) = outcome?;
+                    let dp_id = outcome?;
                     response[..4].copy_from_slice(&dp_id.to_le_bytes());
-                    response[4..8].copy_from_slice(&device_id.to_le_bytes());
-                    Ok(8)
+                    Ok(4)
                 }
                 BridgeCommand::DiagnosticSwdio => {
                     let [level] = payload else {
                         return Err(SwdError::Protocol(0));
                     };
-                    self.select_stm32_passively()
+                    self.release_pads()
                         .map_err(|_| SwdError::Protocol(0))?;
-                    self.reset_all
+                    self.reset
                         .set_low()
                         .map_err(|_| SwdError::Protocol(0))?;
                     self.hold_reset(true).map_err(|_| SwdError::Protocol(0))?;
@@ -519,93 +448,34 @@ mod app {
                     response[0] = u8::from(observed);
                     Ok(1)
                 }
-                BridgeCommand::RomSync => {
-                    // The STM32 system-memory bootloader's autobaud handshake
-                    // (AN3155): it runs at 8E1, takes 0x7F, and answers ACK.
-                    //
-                    // Deliberately knows nothing about how the target got here.
-                    // Asking an application to jump to its bootloader means
-                    // speaking that application's protocol, and a debug probe
-                    // that hard-codes one product's config frames stops being a
-                    // probe. The host sends whatever its own firmware needs via
-                    // `uart-send`, then calls this to see whether the ROM
-                    // answered.
-                    if !payload.is_empty() {
-                        return Err(SwdError::Protocol(0));
-                    }
-                    self.display
-                        .change_parity(Parity::ParityEven)
-                        .map_err(|_| SwdError::Protocol(0))?;
-                    let sync = (|| {
-                        self.display.clear_rx().map_err(|_| SwdError::Protocol(0))?;
-                        Self::bind_disp_tx().map_err(|_| SwdError::Protocol(0))?;
-                        self.display
-                            .write(&[0x7f])
-                            .map_err(|_| SwdError::Protocol(0))?;
-                        self.display
-                            .wait_tx_done(100)
-                            .map_err(|_| SwdError::Protocol(0))?;
-                        Ok(self.display.read(response, 200).unwrap_or(0))
-                    })();
-                    // Restore 8N1 whatever happened: the display UART is shared
-                    // and every other user of it speaks no parity.
-                    let parity_restore = self
-                        .display
-                        .change_parity(Parity::ParityNone)
-                        .map_err(|_| SwdError::Protocol(0));
-                    let length = sync?;
-                    parity_restore?;
-                    Ok(length)
-                }
-                BridgeCommand::Boot0Entry => {
-                    // The hardware route into system memory, for a target whose
-                    // application cannot be asked nicely - or has none. Option
-                    // bytes decide whether BOOT0 is honoured at all.
-                    if !payload.is_empty() {
-                        return Err(SwdError::Protocol(0));
-                    }
-                    self.reset_all
-                        .set_low()
-                        .map_err(|_| SwdError::Protocol(0))?;
-                    self.hold_reset(true).map_err(|_| SwdError::Protocol(0))?;
-                    self.swd
-                        .as_mut()
-                        .ok_or(SwdError::Protocol(0))?
-                        .diagnostic_drive_boot0(true);
-                    thread::sleep(Duration::from_millis(10));
-                    self.hold_reset(false).map_err(|_| SwdError::Protocol(0))?;
-                    thread::sleep(Duration::from_millis(10));
-                    self.swd.as_mut().ok_or(SwdError::Protocol(0))?.disconnect();
-                    Ok(0)
-                }
                 BridgeCommand::UartSend => {
-                    // Write to the STM32's control UART and capture whatever it
+                    // Write to the target's UART and capture whatever it
                     // answers, in one round trip. The plane is request/response,
                     // so a separate receive would race the reply.
-                    self.display
+                    self.uart
                         .change_parity(Parity::ParityNone)
                         .map_err(|_| SwdError::Protocol(0))?;
-                    self.display.clear_rx().map_err(|_| SwdError::Protocol(0))?;
-                    Self::bind_disp_tx().map_err(|_| SwdError::Protocol(0))?;
-                    let written = self.display.write(payload);
-                    let drained = self.display.wait_tx_done(200);
+                    self.uart.clear_rx().map_err(|_| SwdError::Protocol(0))?;
+                    Self::bind_uart_pins().map_err(|_| SwdError::Protocol(0))?;
+                    let written = self.uart.write(payload);
+                    let drained = self.uart.wait_tx_done(200);
                     // Release the line whatever happened above: leaving the
-                    // bridge driving DISP_TX would fight the STM32's own
+                    // bridge driving UART_TX would fight the target's own
                     // transmitter, which is the contention this pin map exists
                     // to avoid.
-                    // DISP_TX stays bound; see the constructor.
+                    // UART_TX stays bound; see the constructor.
                     written.map_err(|_| SwdError::Protocol(0))?;
                     drained.map_err(|_| SwdError::Protocol(0))?;
                     // Ten bytes are reserved by the bridge envelope.
                     let capacity = response.len().min(BRIDGE_MAX_FRAME - 10);
                     Ok(self
-                        .display
+                        .uart
                         .read(&mut response[..capacity], 200)
                         .unwrap_or(0))
                 }
                 BridgeCommand::UartReceive => {
                     // An optional little-endian u16 of milliseconds to listen
-                    // for. The bridge is a passive tap on the STM32's transmit
+                    // for. The bridge is a passive tap on the target's transmit
                     // line, so the window is the whole measurement.
                     let window_ms: u32 = match payload {
                         [] => 1000,
@@ -614,14 +484,14 @@ mod app {
                     };
                     // The host abandons a command after three seconds.
                     let window_ms = window_ms.min(2_000);
-                    self.display
+                    self.uart
                         .change_parity(Parity::ParityNone)
                         .map_err(|_| SwdError::Protocol(0))?;
                     // Deliberately no `clear_rx`: the driver's buffer is the
                     // only thing holding traffic that arrived between calls,
                     // and discarding it made a passive tap miss everything it
                     // was not lucky enough to be inside the window for.
-                    // DISP_TX stays bound; see the constructor.
+                    // UART_TX stays bound; see the constructor.
                     // Ten bytes are reserved by the bridge envelope.
                     let capacity = response.len().min(BRIDGE_MAX_FRAME - 10);
                     // `read` returns as soon as it has any byte at all, so a
@@ -637,7 +507,7 @@ mod app {
                         }
                         // This argument is FreeRTOS ticks, not milliseconds.
                         let ticks = TickType::from(remaining).ticks() as u32;
-                        match self.display.read(&mut response[filled..capacity], ticks.max(1)) {
+                        match self.uart.read(&mut response[filled..capacity], ticks.max(1)) {
                             Ok(0) | Err(_) => break,
                             Ok(n) => filled += n,
                         }
@@ -660,9 +530,9 @@ mod app {
                             uart_port_t_UART_NUM_1,
                             UART_PIN_NO_CHANGE,
                             if swapped {
-                                pinmap::DISP_TX
+                                pinmap::UART_TX
                             } else {
-                                pinmap::DISP_RX
+                                pinmap::UART_RX
                             },
                             UART_PIN_NO_CHANGE,
                             UART_PIN_NO_CHANGE,
@@ -670,16 +540,16 @@ mod app {
                     })
                     .map_err(|_| SwdError::Protocol(0))?;
                     let capture = (|| {
-                        self.display
+                        self.uart
                             .change_parity(Parity::ParityNone)
                             .map_err(|_| SwdError::Protocol(0))?;
-                        self.display.clear_rx().map_err(|_| SwdError::Protocol(0))?;
-                        // DISP_TX stays bound; see the constructor.
-                        self.pulse_reset_all_low_release()
+                        self.uart.clear_rx().map_err(|_| SwdError::Protocol(0))?;
+                        // UART_TX stays bound; see the constructor.
+                        self.pulse_reset_low_release()
                             .map_err(|_| SwdError::Protocol(0))?;
                         let capacity = response.len().min(BRIDGE_MAX_FRAME - 10);
                         Ok(self
-                            .display
+                            .uart
                             .read(&mut response[..capacity], 200)
                             .unwrap_or(0))
                     })();
@@ -687,7 +557,7 @@ mod app {
                         uart_set_pin(
                             uart_port_t_UART_NUM_1,
                             UART_PIN_NO_CHANGE,
-                            pinmap::DISP_RX,
+                            pinmap::UART_RX,
                             UART_PIN_NO_CHANGE,
                             UART_PIN_NO_CHANGE,
                         )
@@ -696,86 +566,6 @@ mod app {
                     let length = capture?;
                     restore?;
                     Ok(length)
-                }
-                BridgeCommand::MuxProbe => {
-                    let [target] = payload else {
-                        return Err(SwdError::Protocol(0));
-                    };
-                    let target = match target {
-                        0 => ProgrammingTarget::Stm32,
-                        1 => ProgrammingTarget::Aux2,
-                        2 => ProgrammingTarget::Aux0,
-                        3 => ProgrammingTarget::Aux1,
-                        _ => return Err(SwdError::Protocol(0)),
-                    };
-                    if let Some(swd) = self.swd.as_mut() {
-                        swd.disconnect();
-                    }
-                    let operation = (|| {
-                        let (s0, s1) = target.selector();
-                        if s0 {
-                            self.asw_s0.set_high().map_err(|_| SwdError::Protocol(0))?;
-                        } else {
-                            self.asw_s0.set_low().map_err(|_| SwdError::Protocol(0))?;
-                        }
-                        if s1 {
-                            self.asw_s1.set_high().map_err(|_| SwdError::Protocol(0))?;
-                        } else {
-                            self.asw_s1.set_low().map_err(|_| SwdError::Protocol(0))?;
-                        }
-                        thread::sleep(Duration::from_millis(5));
-                        // SAFETY: GPIO1/GPIO2 are owned input/output pins;
-                        // reading the pad verifies voltage, not just latch state.
-                        response[7] = u8::from(unsafe { gpio_get_level(pinmap::ASW_S0) != 0 });
-                        response[8] = u8::from(unsafe { gpio_get_level(pinmap::ASW_S1) != 0 });
-                        let swd = self.swd.as_mut().ok_or(SwdError::Protocol(0))?;
-                        let (swdio, swclk) = swd.released_line_state();
-                        response[0] = u8::from(swdio);
-                        response[1] = u8::from(swclk);
-                        Ok(if target == ProgrammingTarget::Aux2 {
-                            None
-                        } else if swdio {
-                            Some(swd.initialize())
-                        } else {
-                            Some(Err(SwdError::LineHeldLow))
-                        })
-                    })();
-                    // Restore the passive STM32 mux state even if selector
-                    // drive/readback or target probing failed.
-                    if let Some(swd) = self.swd.as_mut() {
-                        swd.disconnect();
-                    }
-                    let cleanup_s0 = self.asw_s0.set_low().map_err(|_| SwdError::Protocol(0));
-                    let cleanup_s1 = self.asw_s1.set_low().map_err(|_| SwdError::Protocol(0));
-                    self.selected = ProgrammingTarget::Stm32;
-                    self.bridge_attached = false;
-                    let result = operation?;
-                    cleanup_s0?;
-                    cleanup_s1?;
-                    match result {
-                        None => {
-                            response[2] = 9;
-                            response[3..7].fill(0);
-                        }
-                        Some(Ok(dp_id)) => {
-                            response[2] = 1;
-                            response[3..7].copy_from_slice(&dp_id.to_le_bytes());
-                        }
-                        Some(Err(error)) => {
-                            response[2] = match error {
-                                SwdError::Protocol(ack) => 0x80 | ack,
-                                SwdError::LineHeldLow => 2,
-                                SwdError::InvalidDpId => 3,
-                                SwdError::PowerTimeout => 4,
-                                SwdError::WaitTimeout => 5,
-                                SwdError::Fault => 6,
-                                SwdError::Parity => 7,
-                                SwdError::Unaligned => 8,
-                            };
-                            response[3..7].fill(0);
-                        }
-                    }
-                    Ok(9)
                 }
                 BridgeCommand::Detach => {
                     if let Some(swd) = self.swd.as_mut() {
@@ -857,7 +647,7 @@ mod app {
                         [low, high] => u16::from_le_bytes([*low, *high]),
                         _ => return Err(SwdError::Protocol(0)),
                     };
-                    self.select_stm32_passively()
+                    self.release_pads()
                         .map_err(|_| SwdError::Protocol(0))?;
                     let (swdio, swclk) = self
                         .swd
@@ -869,7 +659,7 @@ mod app {
                     Ok(2)
                 }
                 BridgeCommand::WireProbe => {
-                    self.select_stm32_passively()
+                    self.release_pads()
                         .map_err(|_| SwdError::Protocol(0))?;
                     let swd = self.swd.as_mut().ok_or(SwdError::Protocol(0))?;
                     let (first, second) = match payload {
@@ -902,7 +692,7 @@ mod app {
                         ),
                         _ => return Err(SwdError::Protocol(0)),
                     };
-                    self.select_stm32_passively()
+                    self.release_pads()
                         .map_err(|_| SwdError::Protocol(0))?;
                     let swd = self.swd.as_mut().ok_or(SwdError::Protocol(0))?;
                     let (dpidr_ack, write_ack, before, after) =
@@ -961,18 +751,20 @@ mod app {
                     // Which board this firmware was built for. Worth a command
                     // of its own: a mismatch is not a wrong answer, it is two
                     // sets of outputs fighting over the same nets.
-                    for (slot, pin) in response[..7].iter_mut().zip([
-                        pinmap::PROG_SWDIO,
-                        pinmap::PROG_SWCLK,
-                        pinmap::RESET_ALL,
-                        pinmap::ASW_S0,
-                        pinmap::ASW_S1,
-                        pinmap::DISP_TX,
-                        pinmap::DISP_RX,
+                    // The debug port first, then the serial pins. A board
+                    // built on this bridge appends its own after these; the
+                    // host reports the extras positionally, because only that
+                    // board's firmware knows what they are.
+                    for (slot, pin) in response[..5].iter_mut().zip([
+                        pinmap::SWDIO,
+                        pinmap::SWCLK,
+                        pinmap::RESET,
+                        pinmap::UART_TX,
+                        pinmap::UART_RX,
                     ]) {
                         *slot = pin as u8;
                     }
-                    Ok(7)
+                    Ok(5)
                 }
                 BridgeCommand::Echo => {
                     // Returns a payload without touching the wire, so the
@@ -1043,7 +835,7 @@ mod app {
                     }
                     let bits =
                         u64::from_le_bytes(pattern.try_into().map_err(|_| SwdError::Protocol(0))?);
-                    self.select_stm32_passively()
+                    self.release_pads()
                         .map_err(|_| SwdError::Protocol(0))?;
                     let observed = self
                         .swd
@@ -1126,7 +918,7 @@ mod app {
                     Ok(0)
                 }
                 BridgeCommand::LineState => {
-                    self.select_stm32_passively()
+                    self.release_pads()
                         .map_err(|_| SwdError::Protocol(0))?;
                     let (swdio, swclk) = self
                         .swd
@@ -1136,15 +928,15 @@ mod app {
                     response[..3].copy_from_slice(&[
                         u8::from(swdio),
                         u8::from(swclk),
-                        u8::from(self.reset_all.is_high()),
+                        u8::from(self.reset.is_high()),
                     ]);
                     self.bridge_attached = false;
                     Ok(3)
                 }
                 BridgeCommand::ResetLineState => {
-                    self.select_stm32_passively()
+                    self.release_pads()
                         .map_err(|_| SwdError::Protocol(0))?;
-                    self.reset_all
+                    self.reset
                         .set_low()
                         .map_err(|_| SwdError::Protocol(0))?;
                     self.hold_reset(true).map_err(|_| SwdError::Protocol(0))?;
@@ -1154,7 +946,7 @@ mod app {
                         .as_mut()
                         .ok_or(SwdError::Protocol(0))?
                         .released_line_state();
-                    let asserted_reset = self.reset_all.is_high();
+                    let asserted_reset = self.reset.is_high();
                     self.hold_reset(false).map_err(|_| SwdError::Protocol(0))?;
                     thread::sleep(Duration::from_millis(10));
                     let (released_swdio, released_swclk) = self
@@ -1168,29 +960,32 @@ mod app {
                         u8::from(asserted_reset),
                         u8::from(released_swdio),
                         u8::from(released_swclk),
-                        u8::from(self.reset_all.is_high()),
+                        u8::from(self.reset.is_high()),
                     ]);
                     self.bridge_attached = false;
                     Ok(6)
                 }
-                // Reset drives the shared RESET_ALL net, which reaches every
-                // target regardless of where the mux points, so neither of
-                // these touches the mux or the SWD link. They used to, and
+                // Reset drives the target's reset net and nothing else, so
+                // neither of these touches the SWD link. They used to, and
                 // that made them unusable for connect-under-reset: a debug
                 // sequence asserts reset *after* attaching, and tearing the
                 // link down underneath it fails the very next transfer.
                 BridgeCommand::ResetAssert => {
                     self.hold_reset(true).map_err(|_| SwdError::Protocol(0))?;
                     thread::sleep(Duration::from_millis(10));
-                    response[0] = u8::from(self.reset_all.is_high());
+                    response[0] = u8::from(self.reset.is_high());
                     Ok(1)
                 }
                 BridgeCommand::ResetRelease => {
                     self.hold_reset(false).map_err(|_| SwdError::Protocol(0))?;
                     thread::sleep(Duration::from_millis(10));
-                    response[0] = u8::from(self.reset_all.is_high());
+                    response[0] = u8::from(self.reset.is_high());
                     Ok(1)
                 }
+                // Answered in `bridge_command` before reaching here, because
+                // "this board defines no such command" is a dispatch fact and
+                // not something that happened on the SWD wire.
+                BridgeCommand::Extension(_) => Err(SwdError::Protocol(0)),
             }
         }
     }
@@ -1303,20 +1098,13 @@ mod app {
         esp_idf_svc::log::EspLogger::initialize_default();
 
         info!(
-            "Pin map: SWDIO=GPIO{} SWCLK=GPIO{} RESET_ALL=GPIO{} ASW_S0=GPIO{} \
-             ASW_S1=GPIO{} DISP_TX=GPIO{} DISP_RX=GPIO{} \
-             STEP_AIN1=GPIO{} STEP_AIN2=GPIO{} STEP_BIN1=GPIO{} STEP_BIN2=GPIO{}",
-            pinmap::PROG_SWDIO,
-            pinmap::PROG_SWCLK,
-            pinmap::RESET_ALL,
-            pinmap::ASW_S0,
-            pinmap::ASW_S1,
-            pinmap::DISP_TX,
-            pinmap::DISP_RX,
-            pinmap::STEP_AIN1,
-            pinmap::STEP_AIN2,
-            pinmap::STEP_BIN1,
-            pinmap::STEP_BIN2
+            "Pin map: SWDIO=GPIO{} SWCLK=GPIO{} RESET=GPIO{} \
+             UART_TX=GPIO{} UART_RX=GPIO{}",
+            pinmap::SWDIO,
+            pinmap::SWCLK,
+            pinmap::RESET,
+            pinmap::UART_TX,
+            pinmap::UART_RX
         );
 
         let peripherals = Peripherals::take()?;
@@ -1344,38 +1132,30 @@ mod app {
                 .take()
                 .with_context(|| format!("GPIO{number} is claimed by two signals"))
         };
-        let mut asw_s0 = PinDriver::input_output(take(pinmap::ASW_S0)?, Pull::Floating)?;
-        let mut asw_s1 = PinDriver::input_output(take(pinmap::ASW_S1)?, Pull::Floating)?;
-        asw_s0.set_low()?;
-        asw_s1.set_low()?;
+        let mut reset = PinDriver::input_output(take(pinmap::RESET)?, Pull::Floating)?;
+        reset.set_low()?;
+        // Released to an input immediately: the level is the target's pull-up
+        // to set, not this firmware's. Named through `pinmap` rather than
+        // written as a literal — a literal here once outlived the revision it
+        // was true for and quietly became "release some other board's pin".
+        Hub::set_gpio_direction(pinmap::RESET, gpio_mode_t_GPIO_MODE_INPUT)?;
 
-        let mut reset_all = PinDriver::input_output(take(pinmap::RESET_ALL)?, Pull::Floating)?;
-        reset_all.set_low()?;
-        // The pin this releases is `RESET_ALL`, whichever pin that is. It was
-        // written as a literal 7 when 7 was `RESET_ALL` on the v1.0 board; on
-        // revision 2 that signal is GPIO21 and GPIO7 is the actuator's `AIN1`,
-        // so the literal had quietly become "set one of the motor bridges back
-        // to an input". Only the ordering saved it — the actuator claims its
-        // pins later — which is not a thing to rely on.
-        Hub::set_gpio_direction(pinmap::RESET_ALL, gpio_mode_t_GPIO_MODE_INPUT)?;
-
-        let display = UartDriver::new(
+        let uart = UartDriver::new(
             peripherals.uart1,
-            take(pinmap::DISP_TX)?,
-            take(pinmap::DISP_RX)?,
+            take(pinmap::UART_TX)?,
+            take(pinmap::UART_RX)?,
             Option::<esp_idf_svc::hal::gpio::AnyIOPin>::None,
             Option::<esp_idf_svc::hal::gpio::AnyIOPin>::None,
             &UartConfig::new().baudrate(Hertz(115_200)),
         )?;
-        // DISP_TX stays bound to UART1 for the life of the firmware.
+        // UART_TX stays bound to UART1 for the life of the firmware.
         //
         // It used to be released to an input here and re-driven around every
-        // write, which was right when this pin was believed to sit on the
-        // STM32's *transmit* line - two transmitters on one wire is real
-        // contention. Direction-finding on the harness showed otherwise:
-        // DISP_TX lands on the STM32's PA10, which is its UART *receive*
-        // input and drives nothing. There is nothing to contend with, and the
-        // release was not free - ESP-IDF's `gpio_set_direction(_, INPUT)`
+        // write, which would be right if this pin sat on the target's
+        // *transmit* line - two transmitters on one wire is real contention.
+        // It does not: UART_TX is wired to the target's receive input, which
+        // drives nothing, so there is nothing to contend with. The release was
+        // also not free - ESP-IDF's `gpio_set_direction(_, INPUT)`
         // calls `gpio_output_disable`, which rewrites the pad's
         // `func_out_sel` to `SIG_GPIO_OUT_IDX` to guarantee no peripheral is
         // routed there. Re-enabling the output afterwards restores the driver
@@ -1383,31 +1163,16 @@ mod app {
         // indistinguishable from a healthy idle line - and not one byte ever
         // left. The far end saw a quiet, error-free, permanently empty wire.
         let swd = EspSwdIo::new(
-            take(pinmap::PROG_SWDIO)?,
-            take(pinmap::PROG_SWCLK)?,
+            take(pinmap::SWDIO)?,
+            take(pinmap::SWCLK)?,
             SWD_PINS_SWAPPED,
         )?;
 
-        // The board's actuator. Started before the network so the bridges are
-        // driven to coast early: a motor driver leaves its outputs undefined out of
-        // reset, and the window where nothing owns those pins is the window
-        // where the motor can be energised by accident.
-        let actuator = crate::actuator_hw::start(
-            take(pinmap::STEP_AIN1)?,
-            take(pinmap::STEP_AIN2)?,
-            take(pinmap::STEP_BIN1)?,
-            take(pinmap::STEP_BIN2)?,
-        )?;
-        let actuator_planner = actuator.planner();
-
         let wifi_control = Arc::new(Mutex::new(WifiControl::default()));
         let hub = Arc::new(Mutex::new(Hub {
-            asw_s0,
-            asw_s1,
-            reset_all,
-            display,
+            reset,
+            uart,
             swd: Some(SwdLink::new(swd)),
-            selected: ProgrammingTarget::Stm32,
             wifi: wifi_control.clone(),
             bridge_attached: false,
             reset_held: false,
@@ -1432,10 +1197,9 @@ mod app {
 
         spawn_network_bridge(hub.clone())?;
 
-        // Explicit rather than defaulted. The control page opens one connection for
-        // the page and then polls status while it is on screen, so a couple of
-        // phones plus a curl is the realistic load — and every socket is a
-        // buffer this chip pays for whether or not anything connects.
+        // Explicit rather than defaulted. The realistic load is a health
+        // poller and the odd curl — every socket is a buffer this chip pays
+        // for whether or not anything ever connects to it.
         let mut server = EspHttpServer::new(&esp_idf_svc::http::server::Configuration {
             stack_size: 8192,
             // A websocket holds its socket for as long as the page is open,
@@ -1448,10 +1212,7 @@ mod app {
             lru_purge_enable: true,
             ..Default::default()
         })?;
-        register_handlers(&mut server, hub, wifi_control.clone(), actuator_planner)?;
-        // Dropping `actuator` cancels its timer and the motor stops answering,
-        // so it is held here for as long as the firmware runs.
-        let _actuator = actuator;
+        register_handlers(&mut server, hub, wifi_control.clone())?;
 
         // What the radio should be on, read from storage once. Re-reading it
         // every pass reopened the NVS handle twice a second, which is both
@@ -2034,320 +1795,15 @@ mod app {
         }))
     }
 
-    /// actuator control: status, jog, bounded moves, stop, release.
-    fn register_actuator_handlers(
-        server: &mut EspHttpServer<'static>,
-        actuator: crate::actuator_hw::Shared,
-    ) -> Result<()> {
-        server.fn_handler(esprobe_firmware::control page::PATH, Method::Get, move |req| {
-            let hash = esprobe_firmware::control page::ETAG_HASH;
-            let etag = format!("\"{hash:016x}\"");
-            // A phone that reloads the page should not pull it again over the
-            // same access point that is carrying the jog commands.
-            if req.header("If-None-Match").is_some_and(|tag| tag == etag) {
-                req.into_response(304, None, &[("ETag", etag.as_str())])?;
-                return Ok::<(), anyhow::Error>(());
-            }
-            // No Content-Length here. It was set once and the server ignored
-            // it: esp-idf's httpd frames the body itself and sends this
-            // chunked, so the header was a claim the response did not honour.
-            // The caching above is what actually saves the transfer.
-            let mut response = req.into_response(
-                200,
-                None,
-                &[
-                    ("Content-Type", "text/html; charset=utf-8"),
-                    ("ETag", etag.as_str()),
-                    ("Cache-Control", "public, max-age=60, must-revalidate"),
-                ],
-            )?;
-            response.write_all(esprobe_firmware::control page::PAGE.as_bytes())?;
-            Ok::<(), anyhow::Error>(())
-        })?;
-
-        let state = actuator.clone();
-        server.fn_handler(esprobe_firmware::control page::STATUS, Method::Get, move |req| {
-            let body = {
-                let planner = state.lock().map_err(|_| anyhow!("actuator lock poisoned"))?;
-                format!(
-                    "{{\"ok\":true,\"position\":{},\"steps_per_s\":{},\"moving\":{},\
-                     \"remaining\":{},\"max_steps_per_s\":{},\"accel\":{},\
-                     \"min_accel\":{},\"max_accel\":{}}}\n",
-                    planner.position(),
-                    planner.rate(),
-                    planner.is_moving(),
-                    match planner.remaining() {
-                        Some(left) => left.to_string(),
-                        None => String::from("null"),
-                    },
-                    esprobe_firmware::actuator::MAX_STEPS_PER_S,
-                    planner.accel(),
-                    esprobe_firmware::actuator::MIN_ACCEL_STEPS_PER_S2,
-                    esprobe_firmware::actuator::MAX_ACCEL_STEPS_PER_S2,
-                )
-            };
-            req.into_ok_response()?.write_all(body.as_bytes())?;
-            Ok::<(), anyhow::Error>(())
-        })?;
-
-        // Every command body is read the same way, so the size limit and the
-        // "is it even text" check live in one place rather than four.
-        fn read_body(req: &mut esp_idf_svc::http::server::Request<&mut esp_idf_svc::http::server::EspHttpConnection<'_>>) -> Result<String> {
-            const MAX: usize = 128;
-            let length = req.content_len().unwrap_or(0) as usize;
-            if length > MAX {
-                return Err(anyhow!("body must be at most {MAX} bytes"));
-            }
-            let mut buffer = vec![0; length];
-            req.read_exact(&mut buffer)?;
-            Ok(String::from_utf8(buffer)?)
-        }
-
-        let state = actuator.clone();
-        server.fn_handler(esprobe_firmware::control page::JOG, Method::Post, move |mut req| {
-            let body = match read_body(&mut req) {
-                Ok(body) => body,
-                Err(error) => {
-                    req.into_status_response(400)?
-                        .write_all(format!("{error}\n").as_bytes())?;
-                    return Ok::<(), anyhow::Error>(());
-                }
-            };
-            let Some(rate) = esprobe_firmware::actuator::json_i32(&body, "steps_per_s") else {
-                req.into_status_response(400)?
-                    .write_all(b"expected {\"steps_per_s\":<integer>}\n")?;
-                return Ok::<(), anyhow::Error>(());
-            };
-            let now = unsafe { esp_idf_svc::sys::esp_timer_get_time() } as u64;
-            let seq = esprobe_firmware::actuator::json_i64(&body, "seq");
-            let (applied, stale) = {
-                let mut planner = state.lock().map_err(|_| anyhow!("actuator lock poisoned"))?;
-                // A jog that lost a race with a later command is dropped rather
-                // than obeyed. The case this exists for is one still in flight
-                // when a finger lifts, which would otherwise land after the stop
-                // and run the motor until the watchdog caught it.
-                if planner.accept(seq) {
-                    planner.jog(rate, now);
-                    (planner.rate(), false)
-                } else {
-                    (planner.rate(), true)
-                }
-            };
-            req.into_ok_response()?.write_all(
-                format!("{{\"ok\":true,\"steps_per_s\":{applied},\"stale\":{stale}}}\n")
-                    .as_bytes(),
-            )?;
-            Ok::<(), anyhow::Error>(())
-        })?;
-
-        let state = actuator.clone();
-        server.fn_handler(esprobe_firmware::control page::MOVE, Method::Post, move |mut req| {
-            let body = match read_body(&mut req) {
-                Ok(body) => body,
-                Err(error) => {
-                    req.into_status_response(400)?
-                        .write_all(format!("{error}\n").as_bytes())?;
-                    return Ok::<(), anyhow::Error>(());
-                }
-            };
-            let Some(steps) = esprobe_firmware::actuator::json_i32(&body, "steps") else {
-                req.into_status_response(400)?
-                    .write_all(b"expected {\"steps\":<integer>,\"steps_per_s\":<integer>}\n")?;
-                return Ok::<(), anyhow::Error>(());
-            };
-            // A move without a rate is a move at a default one, not an error:
-            // the nudge buttons only ever vary the distance.
-            let rate = esprobe_firmware::actuator::json_i32(&body, "steps_per_s").unwrap_or(300);
-            let now = unsafe { esp_idf_svc::sys::esp_timer_get_time() } as u64;
-            let seq = esprobe_firmware::actuator::json_i64(&body, "seq");
-            let stale = {
-                let mut planner = state.lock().map_err(|_| anyhow!("actuator lock poisoned"))?;
-                if planner.accept(seq) {
-                    planner.move_by(steps, rate.max(0) as u32, now);
-                    false
-                } else {
-                    true
-                }
-            };
-            req.into_ok_response()?.write_all(
-                format!("{{\"ok\":true,\"steps\":{steps},\"stale\":{stale}}}\n").as_bytes(),
-            )?;
-            Ok::<(), anyhow::Error>(())
-        })?;
-
-        let state = actuator.clone();
-        server.fn_handler(
-            esprobe_firmware::control page::HOLD,
-            Method::Post,
-            move |mut req| {
-                let body = match read_body(&mut req) {
-                    Ok(body) => body,
-                    Err(error) => {
-                        req.into_status_response(400)?
-                            .write_all(format!("{error}\n").as_bytes())?;
-                        return Ok::<(), anyhow::Error>(());
-                    }
-                };
-                // A bench aid, not part of driving a motor: it holds one
-                // excitation state so a meter can be put across AOUT/BOUT and
-                // answer whether the driver responds to its inputs at all.
-                let state_index = esprobe_firmware::actuator::json_i32(&body, "state").unwrap_or(0);
-                let seconds = esprobe_firmware::actuator::json_i32(&body, "seconds").unwrap_or(3);
-                if !(0..=7).contains(&state_index) || seconds <= 0 {
-                    req.into_status_response(400)?.write_all(
-                        b"expected {\"state\":0..=7,\"seconds\":<positive integer>}\n",
-                    )?;
-                    return Ok::<(), anyhow::Error>(());
-                }
-                let hold_us = (seconds as u64).saturating_mul(1_000_000);
-                let now = unsafe { esp_idf_svc::sys::esp_timer_get_time() } as u64;
-                {
-                    let mut planner =
-                        state.lock().map_err(|_| anyhow!("actuator lock poisoned"))?;
-                    planner.hold_state(state_index as u8, hold_us, now);
-                }
-                let capped = hold_us.min(esprobe_firmware::actuator::MAX_HOLD_US) / 1_000_000;
-                req.into_ok_response()?.write_all(
-                    format!("{{\"ok\":true,\"state\":{state_index},\"seconds\":{capped}}}\n")
-                        .as_bytes(),
-                )?;
-                Ok::<(), anyhow::Error>(())
-            },
-        )?;
-
-        let state = actuator.clone();
-        server.fn_handler(esprobe_firmware::control page::CONFIG, Method::Post, move |mut req| {
-            let body = match read_body(&mut req) {
-                Ok(body) => body,
-                Err(err) => {
-                    req.into_status_response(400)?
-                        .write_all(format!("{{\"ok\":false,\"error\":\"{err}\"}}\n").as_bytes())?;
-                    return Ok::<(), anyhow::Error>(());
-                }
-            };
-            // Clamped in the planner rather than here, so the bounds cannot
-            // drift apart from the ramp that has to honour them.
-            let accel = match esprobe_firmware::actuator::json_i32(&body, "accel") {
-                Some(accel) => accel,
-                None => {
-                    req.into_status_response(400)?
-                        .write_all(b"{\"ok\":false,\"error\":\"expected an accel field\"}\n")?;
-                    return Ok::<(), anyhow::Error>(());
-                }
-            };
-            let applied = {
-                let mut planner = state.lock().map_err(|_| anyhow!("actuator lock poisoned"))?;
-                planner.set_accel(accel);
-                planner.accel()
-            };
-            req.into_ok_response()?
-                .write_all(format!("{{\"ok\":true,\"accel\":{applied}}}\n").as_bytes())?;
-            Ok::<(), anyhow::Error>(())
-        })?;
-
-        let state = actuator.clone();
-        server.fn_handler(
-            esprobe_firmware::control page::SELFTEST,
-            Method::Post,
-            move |req| {
-                // Stop first: the pins are about to be driven behind the
-                // planner's back, and a motor mid-move would take whatever
-                // pattern the test leaves between its steps.
-                let now = unsafe { esp_idf_svc::sys::esp_timer_get_time() } as u64;
-                state
-                    .lock()
-                    .map_err(|_| anyhow!("actuator lock poisoned"))?
-                    .release(now);
-
-                crate::actuator_hw::request_selftest();
-                // The timer runs every 500us, so this is a handful of passes.
-                let mut bits = None;
-                for _ in 0..200 {
-                    if let Some(result) = crate::actuator_hw::selftest_result() {
-                        bits = Some(result);
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                let Some(bits) = bits else {
-                    req.into_status_response(503)?
-                        .write_all(b"{\"ok\":false,\"error\":\"the actuator timer did not answer\"}\n")?;
-                    return Ok::<(), anyhow::Error>(());
-                };
-
-                let pin = |slot: u32| (bits >> (slot * 2)) & 0b11;
-                let name = ["ain1", "ain2", "bin1", "bin2"];
-                let gpio = [
-                    pinmap::STEP_AIN1,
-                    pinmap::STEP_AIN2,
-                    pinmap::STEP_BIN1,
-                    pinmap::STEP_BIN2,
-                ];
-                let mut body = String::from("{\"ok\":true,\"pins\":[");
-                for slot in 0..4u32 {
-                    let bits = pin(slot);
-                    if slot > 0 {
-                        body.push(',');
-                    }
-                    body.push_str(&format!(
-                        "{{\"name\":\"{}\",\"gpio\":{},\"drove_high\":{},\"drove_low\":{}}}",
-                        name[slot as usize],
-                        gpio[slot as usize],
-                        bits & 1 != 0,
-                        bits & 0b10 != 0
-                    ));
-                }
-                // All four passing means the pads follow what is written to
-                // them. It does not mean anything past the pad is right.
-                let all_ok = (0..4).all(|slot| pin(slot) == 0b11);
-                body.push_str(&format!("],\"all_pins_drive\":{all_ok}}}\n"));
-                req.into_ok_response()?.write_all(body.as_bytes())?;
-                Ok::<(), anyhow::Error>(())
-            },
-        )?;
-
-        for (path, release) in [
-            (esprobe_firmware::control page::STOP, false),
-            (esprobe_firmware::control page::RELEASE, true),
-        ] {
-            let state = actuator.clone();
-            server.fn_handler(path, Method::Post, move |mut req| {
-                let now = unsafe { esp_idf_svc::sys::esp_timer_get_time() } as u64;
-                // A malformed or absent body must not stop this from stopping.
-                // Everything here is best-effort except the stop itself, which
-                // is the one command with no safe failure mode.
-                let seq = read_body(&mut req)
-                    .ok()
-                    .and_then(|body| esprobe_firmware::actuator::json_i64(&body, "seq"));
-                {
-                    let mut planner =
-                        state.lock().map_err(|_| anyhow!("actuator lock poisoned"))?;
-                    // Recorded, not gated: this is what makes an overtaken jog
-                    // stale, and there is no reading of a dropped stop that
-                    // leaves the motor safer.
-                    planner.observe(seq);
-                    if release {
-                        planner.release(now);
-                    } else {
-                        planner.stop(now);
-                    }
-                }
-                req.into_ok_response()?.write_all(b"{\"ok\":true}\n")?;
-                Ok::<(), anyhow::Error>(())
-            })?;
-        }
-
-        Ok(())
-    }
-
+    /// The probe's own HTTP surface: liveness, and nothing else.
+    ///
+    /// The debug port is reached over the bridge, not over REST. A board built
+    /// on this firmware registers its own routes alongside these.
     fn register_handlers(
         server: &mut EspHttpServer<'static>,
         hub: Arc<Mutex<Hub>>,
         wifi: Arc<Mutex<WifiControl>>,
-        actuator: crate::actuator_hw::Shared,
     ) -> Result<()> {
-        register_actuator_handlers(server, actuator.clone())?;
-        crate::ws_link::register(server, actuator)?;
         server.fn_handler("/health", Method::Get, move |req| {
             // Read per request, not captured at start-up. The address is not
             // known when the server is built, and it changes when the probe
@@ -2380,114 +1836,6 @@ mod app {
             Ok::<(), anyhow::Error>(())
         })?;
 
-        let state = hub.clone();
-        server.fn_handler("/api/v1/stm32/probe", Method::Post, move |req| {
-            match state
-                .lock()
-                .map_err(|_| anyhow!("hub lock poisoned"))?
-                .probe_stm32()
-            {
-                Ok((dp, device)) => {
-                    let body = format!(
-                        "{{\"ok\":true,\"dp_id\":\"0x{dp:08x}\",\"device_id\":\"0x{device:08x}\"}}\n"
-                    );
-                    req.into_ok_response()?.write_all(body.as_bytes())?;
-                }
-                Err(error) => {
-                    req.into_status_response(502)?
-                        .write_all(format!("{{\"ok\":false,\"error\":\"{error}\"}}\n").as_bytes())?;
-                }
-            }
-            Ok::<(), anyhow::Error>(())
-        })?;
-
-        let state = hub.clone();
-        server.fn_handler("/api/v1/stm32/flash", Method::Post, move |mut req| {
-            let length = req.content_len().unwrap_or(0) as usize;
-            if length == 0 || length > FLASH_BYTES {
-                req.into_status_response(413)?.write_all(
-                    format!("binary image must be 1..={FLASH_BYTES} bytes\n").as_bytes(),
-                )?;
-                return Ok::<(), anyhow::Error>(());
-            }
-            let mut image = vec![0; length];
-            req.read_exact(&mut image)?;
-            match state
-                .lock()
-                .map_err(|_| anyhow!("hub lock poisoned"))?
-                .flash_stm32(&image)
-            {
-                Ok((dp, device)) => {
-                    let body = format!(
-                        "{{\"ok\":true,\"bytes\":{length},\"verified\":true,\"dp_id\":\"0x{dp:08x}\",\"device_id\":\"0x{device:08x}\"}}\n"
-                    );
-                    req.into_ok_response()?.write_all(body.as_bytes())?;
-                }
-                Err(error) => {
-                    req.into_status_response(502)?
-                        .write_all(format!("{{\"ok\":false,\"error\":\"{error}\"}}\n").as_bytes())?;
-                }
-            }
-            Ok::<(), anyhow::Error>(())
-        })?;
-
-        let state = hub.clone();
-        server.fn_handler("/api/v1/display/tx", Method::Post, move |mut req| {
-            let length = req.content_len().unwrap_or(0) as usize;
-            if length == 0 || length > MAX_DISPLAY_FRAME {
-                req.into_status_response(413)?
-                    .write_all(b"display frame must be 1..=1024 bytes\n")?;
-                return Ok::<(), anyhow::Error>(());
-            }
-            let mut frame = vec![0; length];
-            req.read_exact(&mut frame)?;
-            let written = state
-                .lock()
-                .map_err(|_| anyhow!("hub lock poisoned"))?
-                .write_display(&frame)?;
-            req.into_ok_response()?
-                .write_all(format!("{{\"ok\":true,\"bytes\":{written}}}\n").as_bytes())?;
-            Ok::<(), anyhow::Error>(())
-        })?;
-
-        let state = hub.clone();
-        server.fn_handler("/api/v1/display/rx", Method::Get, move |req| {
-            let mut frame = [0u8; MAX_DISPLAY_FRAME];
-            let read = state
-                .lock()
-                .map_err(|_| anyhow!("hub lock poisoned"))?
-                .display
-                .read(&mut frame, 0)?;
-            req.into_ok_response()?.write_all(&frame[..read])?;
-            Ok::<(), anyhow::Error>(())
-        })?;
-
-        let state = hub.clone();
-        server.fn_handler("/api/v1/aux0/reset", Method::Post, move |req| {
-            state
-                .lock()
-                .map_err(|_| anyhow!("hub lock poisoned"))?
-                .pulse_reset_all()?;
-            req.into_ok_response()?.write_all(b"{\"ok\":true}\n")?;
-            Ok::<(), anyhow::Error>(())
-        })?;
-
-        for (path, target) in [
-            ("/api/v1/mux/stm32", ProgrammingTarget::Stm32),
-            ("/api/v1/mux/aux2", ProgrammingTarget::Aux2),
-            ("/api/v1/mux/aux0", ProgrammingTarget::Aux0),
-            ("/api/v1/mux/aux1", ProgrammingTarget::Aux1),
-        ] {
-            let state = hub.clone();
-            server.fn_handler(path, Method::Post, move |req| {
-                state
-                    .lock()
-                    .map_err(|_| anyhow!("hub lock poisoned"))?
-                    .select(target)?;
-                req.into_ok_response()?.write_all(b"{\"ok\":true}\n")?;
-                Ok::<(), anyhow::Error>(())
-            })?;
-        }
 
         Ok(())
     }

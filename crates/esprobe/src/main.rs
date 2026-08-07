@@ -1,5 +1,5 @@
 use esprobe::{
-    Engine, ROUND_TRIPS, SerialDapProbe, discover_bridge_port, dp_address, gdb, identify,
+    Engine, ROUND_TRIPS, SerialDapProbe, discover_bridge_port, dp_address, gdb, read_debug_port_id,
 };
 
 use std::path::PathBuf;
@@ -147,28 +147,28 @@ enum WifiAction {
 
 #[derive(Subcommand)]
 enum Action {
-    /// Read SWDIO, SWCLK, and RESET_ALL after ESP drive is released.
+    /// Read SWDIO, SWCLK, and the reset line after ESP drive is released.
     Lines,
-    /// Read released SWD levels while RESET_ALL is held low and after release.
+    /// Read released SWD levels while reset is held low and after release.
     ResetLines,
-    /// Hold RESET_ALL low until reset-release or an ESP reboot.
+    /// Hold the target reset line low until reset-release or an ESP reboot.
     ResetAssert,
-    /// Release RESET_ALL to the carrier board's pull-up.
+    /// Release the reset line to the target board's pull-up.
     ResetRelease,
-    /// Alternate RESET_ALL low and released at a fixed interval.
+    /// Alternate the reset line low and released at a fixed interval.
     ResetCycle {
         #[arg(long, default_value_t = 2)]
         seconds: u64,
     },
     /// Attach through probe-rs and report the Cortex-M core status.
     Probe,
-    /// Assert RESET_ALL, prepare SWD, release reset, and attach immediately.
+    /// Assert reset, prepare SWD, release reset, and attach immediately.
     ProbeUnderReset,
-    /// Briefly drive and read back both SWD pads while RESET_ALL is low.
+    /// Briefly drive and read back both SWD pads while reset is low.
     PadSelfTest,
     /// Probe and identify immediately inside the reset-release critical path.
     RecoveryProbe {
-        /// Delay after releasing RESET_ALL before the first DP request.
+        /// Delay after releasing reset before the first DP request.
         #[arg(long, default_value_t = 1_000)]
         delay_us: u16,
     },
@@ -177,36 +177,26 @@ enum Action {
         #[arg(long, default_value_t = 2)]
         seconds: u64,
     },
-    /// Speak the STM32 ROM bootloader's autobaud handshake and report the reply.
-    ///
-    /// Says nothing about how the target got into system memory: send your own
-    /// firmware's command with `uart-send`, or use `boot0-entry`, then run this
-    /// to see whether the ROM is listening. A reply of 79 is ACK.
-    RomSync,
-    /// Reset the target with BOOT0 asserted, the hardware route into the ROM
-    /// bootloader. Whether the pin is honoured is an option-byte decision.
-    Boot0Entry,
-    /// Passively capture bytes from the STM32 display UART.
+    /// Passively capture bytes from the target UART.
     UartReceive {
         /// How long to listen, in milliseconds. The bridge clears the receive
         /// buffer first, so this is the whole capture window.
         #[arg(long, default_value_t = 100)]
         ms: u16,
     },
-    /// Send bytes to the STM32 display UART and print whatever it answers.
+    /// Send bytes to the target UART and print whatever it answers.
     UartSend {
         /// The bytes to send, as hex. Whitespace and a leading `0x` are ignored.
         hex: String,
     },
-    /// Reset the STM32 and atomically capture its startup UART bytes.
+    /// Reset the target and atomically capture its startup UART bytes.
     UartResetCapture {
-        /// Passively listen on GPIO5 instead of the schematic-normal GPIO6.
+        /// Listen on the firmware's alternate receive pin instead of its
+        /// default one, for a board that wires the pair the other way round.
         #[arg(long)]
         swapped: bool,
     },
-    /// Read-only SWD diagnostic on STM32, AUX0, and AUX1 mux channels.
-    MuxScan,
-    /// Program an ELF with probe-rs's STM32 flash algorithm and reset the core.
+    /// Program an ELF with probe-rs's flash algorithm and reset the core.
     Flash {
         #[arg(value_name = "ELF")]
         image: PathBuf,
@@ -414,10 +404,10 @@ fn main() -> Result<()> {
         Action::ListProbes => unreachable!("probe listing returned before a link was opened"),
         Action::Lines => {
             let lines = serial.command(Command::LineState, &[])?;
-            let [swdio, swclk, reset_all] = lines.as_slice() else {
+            let [swdio, swclk, reset] = lines.as_slice() else {
                 bail!("invalid line-state response");
             };
-            println!("released swdio={swdio} swclk={swclk} reset_all={reset_all}");
+            println!("released swdio={swdio} swclk={swclk} reset={reset}");
             return Ok(());
         }
         Action::ResetLines => {
@@ -425,35 +415,35 @@ fn main() -> Result<()> {
             let [
                 asserted_swdio,
                 asserted_swclk,
-                asserted_reset_all,
+                asserted_reset,
                 released_swdio,
                 released_swclk,
-                released_reset_all,
+                released_reset,
             ] = lines.as_slice()
             else {
                 bail!("invalid reset-line-state response");
             };
             println!(
                 "asserted swdio={asserted_swdio} swclk={asserted_swclk} \
-                 reset_all={asserted_reset_all}; released swdio={released_swdio} \
-                 swclk={released_swclk} reset_all={released_reset_all}"
+                 reset={asserted_reset}; released swdio={released_swdio} \
+                 swclk={released_swclk} reset={released_reset}"
             );
             return Ok(());
         }
         Action::ResetAssert => {
             let state = serial.command(Command::ResetAssert, &[])?;
-            let [reset_all] = state.as_slice() else {
+            let [reset] = state.as_slice() else {
                 bail!("invalid reset-assert response");
             };
-            println!("reset_all={reset_all} held=true");
+            println!("reset={reset} held=true");
             return Ok(());
         }
         Action::ResetRelease => {
             let state = serial.command(Command::ResetRelease, &[])?;
-            let [reset_all] = state.as_slice() else {
+            let [reset] = state.as_slice() else {
                 bail!("invalid reset-release response");
             };
-            println!("reset_all={reset_all} held=false");
+            println!("reset={reset} held=false");
             return Ok(());
         }
         Action::ResetCycle { seconds } => {
@@ -462,28 +452,22 @@ fn main() -> Result<()> {
             ctrlc::set_handler(move || handler_stop.store(true, Ordering::Release))
                 .context("failed to install reset-cycle interrupt handler")?;
             let interval = Duration::from_secs(*seconds);
-            println!("cycling RESET_ALL every {seconds}s; press Ctrl-C to stop and release reset");
+            println!("cycling reset line every {seconds}s; press Ctrl-C to stop and release reset");
             while !stop.load(Ordering::Acquire) {
                 let state = serial.command(Command::ResetAssert, &[])?;
-                println!(
-                    "reset_all={} held=true",
-                    state.first().copied().unwrap_or(1)
-                );
+                println!("reset={} held=true", state.first().copied().unwrap_or(1));
                 wait_or_stop(interval, &stop);
                 let state = serial.command(Command::ResetRelease, &[])?;
-                println!(
-                    "reset_all={} held=false",
-                    state.first().copied().unwrap_or(0)
-                );
+                println!("reset={} held=false", state.first().copied().unwrap_or(0));
                 wait_or_stop(interval, &stop);
             }
             let state = serial
                 .command(Command::ResetRelease, &[])
-                .context("failed to release RESET_ALL while stopping reset-cycle")?;
-            let [reset_all] = state.as_slice() else {
+                .context("failed to release reset line while stopping reset-cycle")?;
+            let [reset] = state.as_slice() else {
                 bail!("invalid final reset-release response");
             };
-            println!("reset_all={reset_all} held=false stopped=true");
+            println!("reset={reset} held=false stopped=true");
             return Ok(());
         }
         Action::PadSelfTest => {
@@ -531,35 +515,13 @@ fn main() -> Result<()> {
             }
             serial.command(Command::Detach, &[])?;
             serial.command(Command::ResetRelease, &[])?;
-            println!("swdio=released swclk=released reset_all=released");
-            return Ok(());
-        }
-        Action::RomSync => {
-            let response = serial.command(Command::RomSync, &[])?;
-            print!("rom_reply=");
-            for byte in &response {
-                print!("{byte:02x}");
-            }
-            // 0x79 is the bootloader's ACK; anything else means it is not there.
-            println!(
-                "{}",
-                if response.contains(&0x79) {
-                    "  (ACK - ROM bootloader is listening)"
-                } else {
-                    "  (no ACK - target is not in the ROM bootloader)"
-                }
-            );
-            return Ok(());
-        }
-        Action::Boot0Entry => {
-            serial.command(Command::Boot0Entry, &[])?;
-            println!("boot0=asserted reset=cycled");
+            println!("swdio=released swclk=released reset=released");
             return Ok(());
         }
         Action::UartSend { hex } => {
             let payload = parse_hex(hex)?;
             let response = serial.command(Command::UartSend, &payload)?;
-            print!("stm32_uart_rx=");
+            print!("target_uart_rx=");
             for byte in response {
                 print!("{byte:02x}");
             }
@@ -569,7 +531,7 @@ fn main() -> Result<()> {
         Action::UartReceive { ms } => {
             let payload = ms.to_le_bytes();
             let response = serial.command(Command::UartReceive, &payload)?;
-            print!("stm32_uart_rx=");
+            print!("target_uart_rx=");
             for byte in response {
                 print!("{byte:02x}");
             }
@@ -578,7 +540,7 @@ fn main() -> Result<()> {
         }
         Action::UartResetCapture { swapped } => {
             let response = serial.command(Command::UartResetCapture, &[u8::from(*swapped)])?;
-            print!("stm32_uart_after_reset=");
+            print!("target_uart_after_reset=");
             for byte in response {
                 print!("{byte:02x}");
             }
@@ -594,28 +556,34 @@ fn main() -> Result<()> {
             return Ok(());
         }
         Action::Identify => {
-            let (identity, under_reset) = identify(&mut serial)?;
-            println!("{}", identity.describe());
+            let (id, under_reset) = read_debug_port_id(&mut serial)?;
+            println!("{}", id.describe());
             if under_reset {
                 println!("attach=under-reset (the target does not answer a plain attach)");
             }
-            match identity.target() {
-                Some(target) => println!("probe_rs_target={target}"),
-                None => println!("probe_rs_target=unknown; pass --target explicitly"),
-            }
+            // Deliberately not a chip name. Naming the part takes a vendor
+            // register at a vendor address, and this tool knows no vendors —
+            // probe-rs does, from its own database, once `--target` names one.
             serial.detach()?;
             return Ok(());
         }
         Action::Wifi(_) => unreachable!("wifi runs before any SWD configuration"),
         Action::PinMap => {
             let map = serial.command(Command::PinMap, &[])?;
-            let [swdio, swclk, reset, s0, s1, tx, rx] = map.as_slice() else {
-                bail!("invalid pin-map response");
+            // The first three are the debug port and are all a probe must have.
+            // A board that carries more than one — a UART to the target, a mux,
+            // a second radio — appends its own, and they are reported
+            // positionally rather than named, because only that firmware knows
+            // what they are. Reading a short response as a failure would refuse
+            // the minimal case this command exists to serve.
+            let [swdio, swclk, reset, rest @ ..] = map.as_slice() else {
+                bail!("pin map returned {} bytes, wanted at least 3", map.len());
             };
-            println!(
-                "SWDIO=GPIO{swdio} SWCLK=GPIO{swclk} RESET_ALL=GPIO{reset} \
-                 ASW_S0=GPIO{s0} ASW_S1=GPIO{s1} DISP_TX=GPIO{tx} DISP_RX=GPIO{rx}"
-            );
+            print!("SWDIO=GPIO{swdio} SWCLK=GPIO{swclk} RESET=GPIO{reset}");
+            for (index, pin) in rest.iter().enumerate() {
+                print!(" board{index}=GPIO{pin}");
+            }
+            println!();
             return Ok(());
         }
         Action::Echo { bytes, count } => {
@@ -928,20 +896,6 @@ fn main() -> Result<()> {
             }
             return Ok(());
         }
-        Action::MuxScan => {
-            for (target, name) in [(0_u8, "stm32"), (1, "aux2"), (2, "aux0"), (3, "aux1")] {
-                let response = serial.command(Command::MuxProbe, &[target])?;
-                let [swdio, swclk, status, dp0, dp1, dp2, dp3, s0, s1] = response.as_slice() else {
-                    bail!("invalid mux-probe response for {name}");
-                };
-                let dp_id = u32::from_le_bytes([*dp0, *dp1, *dp2, *dp3]);
-                println!(
-                    "target={name} s0={s0} s1={s1} swdio={swdio} swclk={swclk} \
-                     status=0x{status:02x} dp_id=0x{dp_id:08x}"
-                );
-            }
-            return Ok(());
-        }
         Action::Probe
         | Action::ProbeUnderReset
         | Action::Core(_)
@@ -952,18 +906,18 @@ fn main() -> Result<()> {
         | Action::Dump { .. }
         | Action::Bench { .. } => {}
     }
-    // Always ask the target what it is, even when a name was supplied: the
-    // flash size is needed to back the part up before erasing it, and a
-    // mismatch between what was asked for and what is present is worth seeing.
-    let detection = identify(&mut serial).ok();
+    // Ask the debug port whether it answers at all, and whether it needs reset
+    // held to do it. Not what the part *is* — that takes a vendor register, and
+    // knowing it here would make this tool care which chip it is talking to.
+    // probe-rs names the target from `--target` and its own chip database.
+    let detection = read_debug_port_id(&mut serial).ok();
     if detection.is_some() {
         serial.detach()?;
     }
-    let identity = detection.as_ref().map(|(identity, _)| identity);
-    if let Some((found, under_reset)) = detection.as_ref() {
+    if let Some((id, under_reset)) = detection.as_ref() {
         eprintln!(
             "detected {}{}",
-            found.describe(),
+            id.describe(),
             if *under_reset {
                 " (attached under reset)"
             } else {
@@ -972,31 +926,17 @@ fn main() -> Result<()> {
         );
     }
     // Carry the finding into the probe-rs session: a target that needed reset
-    // held to be identified needs it held to be attached.
+    // held to answer needs it held to be attached.
     if detection
         .as_ref()
         .is_some_and(|(_, under_reset)| *under_reset)
     {
         serial.attach_under_reset = true;
     }
-    let target = match args.target.clone() {
-        Some(target) => target,
-        None => identity
-            .and_then(|found| found.target())
-            .with_context(|| {
-                identity.map_or_else(
-                    || "could not identify the target; pass --target".to_string(),
-                    |found| {
-                        format!(
-                            "{} is not in the family table; pass --target",
-                            found.describe()
-                        )
-                    },
-                )
-            })?
-            .to_string(),
-    };
-    let detected_flash_kib = identity.map_or(0, |found| found.flash_kib);
+    let target = args.target.clone().context(
+        "pass --target: the probe reports the debug port, not the part, \
+         so the chip has to be named",
+    )?;
     let under_reset = matches!(&args.command, Action::ProbeUnderReset)
         || detection.as_ref().is_some_and(|(_, needed)| *needed);
     let serial_speed_khz = serial.speed_khz;
@@ -1037,9 +977,6 @@ fn main() -> Result<()> {
         Action::UartResetCapture { .. } => {
             unreachable!("UART reset-capture command returned before probe attachment")
         }
-        Action::MuxScan => {
-            unreachable!("mux scan command returned before probe attachment")
-        }
         Action::Recover { .. } => {
             unreachable!("line recovery returned before probe attachment")
         }
@@ -1077,9 +1014,6 @@ fn main() -> Result<()> {
         }
         Action::SwdioCycle { .. } => {
             unreachable!("SWDIO cycle returned before probe attachment")
-        }
-        Action::RomSync | Action::Boot0Entry => {
-            unreachable!("ROM bootloader commands return before probe attachment")
         }
         Action::Core(action) => {
             run_core(&mut session, &action)?;
@@ -1175,14 +1109,29 @@ fn main() -> Result<()> {
             // Back up before erasing, always. A device that turns out to be
             // the wrong one, or an image that turns out to be wrong, is
             // recoverable only if this happened first.
-            let flash_bytes = usize::from(detected_flash_kib) * 1024;
+            // Where the flash is, and how much, comes from probe-rs's
+            // description of the named target. It used to come from a vendor
+            // register plus a hardcoded 0x0800_0000 base, which is the ARM
+            // Cortex-M code region as one vendor happens to use it and is
+            // simply wrong on parts that map flash elsewhere.
+            let nvm = session
+                .target()
+                .memory_map
+                .iter()
+                .filter_map(|region| match region {
+                    probe_rs::config::MemoryRegion::Nvm(nvm) => Some(nvm.range.clone()),
+                    _ => None,
+                })
+                .max_by_key(|range| range.end - range.start)
+                .context("the target description declares no non-volatile memory to back up")?;
+            let flash_bytes = (nvm.end - nvm.start) as usize;
             if flash_bytes == 0 {
                 bail!("flash size unknown, so the part cannot be backed up before erasing");
             }
             {
                 let mut core = session.core(0)?;
                 let mut existing = vec![0_u8; flash_bytes];
-                core.read_8(0x0800_0000, &mut existing)?;
+                core.read_8(nvm.start, &mut existing)?;
                 std::fs::write(&backup, &existing)
                     .with_context(|| format!("failed to write {}", backup.display()))?;
                 println!(
@@ -1515,8 +1464,11 @@ fn parse_hex(text: &str) -> anyhow::Result<Vec<u8>> {
         .chars()
         .filter(|c| !c.is_whitespace() && *c != ':' && *c != '_')
         .collect();
-    if cleaned.len() % 2 != 0 {
-        anyhow::bail!("a hex payload needs an even number of digits, got {}", cleaned.len());
+    if !cleaned.len().is_multiple_of(2) {
+        anyhow::bail!(
+            "a hex payload needs an even number of digits, got {}",
+            cleaned.len()
+        );
     }
     (0..cleaned.len())
         .step_by(2)

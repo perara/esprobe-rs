@@ -1,13 +1,23 @@
 //! Fail-closed electrical policy shared by firmware and host tests.
+//!
+//! The question this answers is "may the probe drive a level onto these pads?",
+//! and the only evidence available before driving anything is what the pads
+//! read while released. An unpowered target is the case that matters: driving a
+//! high level into one back-feeds its supply through the pad's protection
+//! diode, which is a way to damage a board rather than debug it.
 
-/// Passive levels observed through mux position `00`.
+/// Levels read from the debug pads while the probe is driving neither.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReleasedSwdState {
-    /// STM32G0 reset defaults: SWDIO pull-up and SWCLK pull-down are visible.
+    /// What a powered, idle ARM debug port looks like: SWDIO pulled up and
+    /// SWCLK pulled down. This is the ADIv5-recommended arrangement and is what
+    /// every part observed so far resets to, but it is a convention rather than
+    /// a guarantee — a target that idles otherwise reads as one of the cases
+    /// below and is refused, which is the safe direction to be wrong in.
     ResetDefaults,
     /// SWDIO is low, so target power and a safe high-level drive are unproven.
     SwdioLow,
-    /// Target pull-up is visible, but SWCLK differs from its reset default.
+    /// Target pull-up is visible, but SWCLK differs from its idle default.
     ClockUnexpectedHigh,
 }
 
@@ -21,7 +31,7 @@ impl ReleasedSwdState {
         }
     }
 
-    /// Whether the STM32-side SWDIO pull-up provides minimum evidence that a
+    /// Whether the target-side SWDIO pull-up provides minimum evidence that a
     /// high-driving operation will not energize an unpowered target.
     #[must_use]
     pub const fn permits_high_drive(self) -> bool {

@@ -18,10 +18,9 @@
 
 ```console
 $ esprobe --url 192.168.0.93 identify
-dev_id=0x460 rev_id=0x2001 family=STM32G07x/G08x flash=128 KiB uid=323538353035510e006e0039
-probe_rs_target=STM32G071RBTx
+dp_id=0x0bc11477 designer=0x23b part=0xc1 rev=0 dp_version=1 minimal=false
 
-$ esprobe --url 192.168.0.93 gdb --port 1234
+$ esprobe --url 192.168.0.93 --target STM32G071RBTx gdb --port 1234
 gdb server on tcp/1234; connect with: target remote :1234
 ```
 
@@ -50,12 +49,15 @@ gives it one that does not.
 `esprobe` is a [probe-rs](https://github.com/probe-rs/probe-rs) *backend*, not
 a reimplementation. ADIv5, the vendor debug sequences, the chip database and
 the CMSIS-Pack flash algorithms are all probe-rs's, reached through the
-standard `DebugProbe` / `RawDapAccess` traits. Programming an STM32G071 needed
-no G0 flash-controller code here at all.
+standard `DebugProbe` / `RawDapAccess` traits. There is no vendor code here at
+all — not a flash algorithm, not a chip table, not a part number. `identify`
+reports the ARM debug port, which is architectural; naming the part is
+`--target`, and probe-rs answers it from its own database.
 
 ## What works
 
-Verified on an STM32G071 and an STM32F407, over both transports.
+Verified on an STM32G071 and an STM32F407, over both transports. Nothing in
+the probe is specific to either; both were named with `--target`.
 
 | | |
 | --- | ---: |
@@ -69,7 +71,7 @@ Verified on an STM32G071 and an STM32F407, over both transports.
 
 The wire is the limit, not the transport: `--depth` moves the bulk figure by
 about one percent, the clock moves it proportionally. 8 MHz is the default
-because it is what a mux path and unshielded bench leads carry reliably;
+because it is what unshielded bench leads carry reliably;
 direct-wired to a devkit, 16 MHz is fine. Dumps at both clocks are
 byte-identical, over USB and Wi-Fi alike.
 
@@ -183,9 +185,15 @@ distinguishes `probe` from a device name — write `probe:3333`.
 
 `probe-rs attach` succeeds against whatever target name you hand it — the same
 board will attach happily as an `STM32G030K8`, an `STM32G071RBTx` and an
-`STM32G081RBTx`. It answers "can I talk to this", never "what is this". So
-`--target` is optional: omit it and the part is identified from its own DBGMCU
-registers first.
+`STM32G081RBTx`. It answers "can I talk to this", never "what is this".
+
+`identify` answers the part this probe can answer honestly: the ARM debug
+port's own `DPIDR`, which is architectural and vendor-neutral. It will tell you
+something is there, who designed the debug port and which DP version it speaks.
+
+It will not tell you the part number. That takes a vendor register at a vendor
+address, and this tool deliberately knows no vendors — it is a wire, not a chip
+database. Name the target with `--target` and probe-rs answers the rest.
 
 ## Layout
 
@@ -239,9 +247,9 @@ so build it from [its own directory](https://github.com/perara/esprobe-rs/tree/m
 
 ## Honest limits
 
-- **One chip family has been exercised hard.** An STM32G071 for the debug and
-  bulk-transfer work, an STM32F407 earlier. The detection table claims more
-  than has been proven.
+- **Two parts have been exercised hard.** An STM32G071 for the debug and
+  bulk-transfer work, an STM32F407 earlier. Nothing in the probe is specific to
+  either, but "should work on any ADIv5 target" is an argument, not a result.
 - **Wi-Fi is slower, and depends on your antenna.** Round trips run 60–160 ms
   against a gateway answering in 0.3 ms on an ESP32-C3 SuperMini, whose antenna
   is [known to be poor](https://hackaday.com/2025/04/07/simple-antenna-makes-for-better-esp32-c3-wifi/).

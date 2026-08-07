@@ -7,7 +7,11 @@ members = ["crates/esprobe", "crates/esprobe-protocol"]
 exclude = ["crates/esprobe-firmware"]
 
 [workspace.package]
-version = "0.1.0"
+# 0.2.0: the bridge stopped speaking one product's application protocol. The
+# `MuxProbe` opcode left for the board that owns it, opcodes 0x80..=0xfe are
+# reserved for downstream products, and `Command` gained a variant — so this is
+# a wire break as well as an API one, and both ends must be rebuilt together.
+version = "0.2.0"
 edition = "2024"
 # Let-chains, which both halves use.
 rust-version = "1.88"

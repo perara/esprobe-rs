@@ -79,104 +79,6 @@ pub fn discover_bridge_port() -> Result<PathBuf> {
     }
 }
 
-/// A known STM32 part, keyed by the `DEV_ID` field of its DBGMCU IDCODE.
-pub struct Family {
-    pub dev_id: u16,
-    pub name: &'static str,
-    /// Where DBGMCU lives, since it is not at one address across families.
-    pub dbgmcu: u32,
-    /// Where the factory-programmed flash size in kibibytes lives.
-    pub flash_size: u32,
-    /// Where the 96-bit unique id lives.
-    pub uid: u32,
-    /// probe-rs target, chosen by flash size where a family spans several.
-    pub target: fn(u16) -> &'static str,
-}
-
-/// DBGMCU addresses worth trying, most likely first. A family cannot be
-/// identified before it is known, so detection reads each in turn and keeps
-/// the first that decodes to something recognised.
-pub const DBGMCU_CANDIDATES: [u32; 2] = [0x4001_5800, 0xE004_2000];
-
-pub const FAMILIES: &[Family] = &[
-    Family {
-        dev_id: 0x466,
-        name: "STM32G03x/G04x",
-        dbgmcu: 0x4001_5800,
-        flash_size: 0x1FFF_75E0,
-        uid: 0x1FFF_7590,
-        target: |kib| {
-            if kib <= 32 {
-                "STM32G030K6Tx"
-            } else {
-                "STM32G030K8Tx"
-            }
-        },
-    },
-    Family {
-        dev_id: 0x460,
-        name: "STM32G07x/G08x",
-        dbgmcu: 0x4001_5800,
-        flash_size: 0x1FFF_75E0,
-        uid: 0x1FFF_7590,
-        target: |kib| {
-            if kib <= 64 {
-                "STM32G071CBTx"
-            } else {
-                "STM32G071RBTx"
-            }
-        },
-    },
-    Family {
-        dev_id: 0x467,
-        name: "STM32G0B1/G0C1",
-        dbgmcu: 0x4001_5800,
-        flash_size: 0x1FFF_75E0,
-        uid: 0x1FFF_7590,
-        target: |_| "STM32G0B1RETx",
-    },
-    Family {
-        dev_id: 0x456,
-        name: "STM32G05x/G06x",
-        dbgmcu: 0x4001_5800,
-        flash_size: 0x1FFF_75E0,
-        uid: 0x1FFF_7590,
-        target: |_| "STM32G051K8Tx",
-    },
-    Family {
-        dev_id: 0x413,
-        name: "STM32F405/F407/F415/F417",
-        dbgmcu: 0xE004_2000,
-        flash_size: 0x1FFF_7A22,
-        uid: 0x1FFF_7A10,
-        target: |_| "STM32F407VETx",
-    },
-];
-
-/// What the target turned out to be.
-pub struct Identity {
-    pub dev_id: u16,
-    pub rev_id: u16,
-    pub family: Option<&'static Family>,
-    pub flash_kib: u16,
-    pub uid: [u32; 3],
-}
-
-impl Identity {
-    pub fn target(&self) -> Option<&'static str> {
-        self.family.map(|family| (family.target)(self.flash_kib))
-    }
-
-    pub fn describe(&self) -> String {
-        let name = self.family.map_or("unrecognised", |family| family.name);
-        format!(
-            "dev_id=0x{:03x} rev_id=0x{:04x} family={name} flash={} KiB \
-             uid={:08x}{:08x}{:08x}",
-            self.dev_id, self.rev_id, self.flash_kib, self.uid[2], self.uid[1], self.uid[0]
-        )
-    }
-}
-
 /// A bank-0 Debug Port register address.
 pub fn dp_address(address: u8) -> RegisterAddress {
     RegisterAddress::DpRegister(DpRegisterAddress {
@@ -203,6 +105,76 @@ pub fn power_up_debug_port(serial: &mut SerialDapProbe, under_reset: bool) -> Re
     Ok(())
 }
 
+/// What the ARM debug port says it is, before any vendor register is touched.
+///
+/// This is the only identity a probe can report without knowing the vendor:
+/// DPIDR is architectural, defined by ADIv5, and every conforming target
+/// answers it. What *part* this is takes a vendor register at a vendor address,
+/// which is a thing this tool deliberately does not know — name the target with
+/// `--target` and probe-rs answers it from its own chip database.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DebugPortId {
+    pub raw: u32,
+    /// JEP106 continuation and identity code of whoever designed the DP.
+    pub designer: u16,
+    pub part_number: u8,
+    pub revision: u8,
+    /// DP architecture version: 1 for DPv1, 2 for DPv2, and so on.
+    pub version: u8,
+    /// Whether the DP reports minimal-DP behaviour (no TRANSACTION COUNTER,
+    /// no PUSHED verify).
+    pub minimal: bool,
+}
+
+impl DebugPortId {
+    #[must_use]
+    pub const fn decode(raw: u32) -> Self {
+        Self {
+            raw,
+            designer: ((raw >> 1) & 0x7ff) as u16,
+            part_number: ((raw >> 20) & 0xff) as u8,
+            revision: ((raw >> 28) & 0xf) as u8,
+            version: ((raw >> 12) & 0xf) as u8,
+            minimal: (raw >> 16) & 1 != 0,
+        }
+    }
+
+    #[must_use]
+    pub fn describe(&self) -> String {
+        format!(
+            "dp_id=0x{:08x} designer=0x{:03x} part=0x{:02x} rev={} dp_version={} minimal={}",
+            self.raw, self.designer, self.part_number, self.revision, self.version, self.minimal
+        )
+    }
+}
+
+/// Reads the debug port's own identity, falling back to connect-under-reset.
+///
+/// A target that resets repeatedly — a corrupt or half-written image will do it
+/// — answers nothing to a plain attach, because it is back in reset before the
+/// first transfer lands. Falling back is the difference between "no answer" and
+/// "recoverable", so it is automatic rather than a flag to reach for.
+///
+/// The `bool` is whether reset had to be held.
+pub fn read_debug_port_id(serial: &mut SerialDapProbe) -> Result<(DebugPortId, bool)> {
+    match read_debug_port_id_once(serial, false) {
+        Ok(id) => Ok((id, false)),
+        Err(_) => read_debug_port_id_once(serial, true).map(|id| (id, true)),
+    }
+}
+
+pub fn read_debug_port_id_once(
+    serial: &mut SerialDapProbe,
+    under_reset: bool,
+) -> Result<DebugPortId> {
+    power_up_debug_port(serial, under_reset)?;
+    let raw = serial.raw_read_register(dp_address(0x00))?;
+    if raw == 0 || raw == u32::MAX {
+        bail!("debug port answered 0x{raw:08x}, which is not an identity");
+    }
+    Ok(DebugPortId::decode(raw))
+}
+
 /// Reads target words over the bridge's bulk path.
 pub fn read_words(serial: &mut SerialDapProbe, address: u32, count: usize) -> Result<Vec<u32>> {
     let mut request = address.to_le_bytes().to_vec();
@@ -219,64 +191,6 @@ pub fn read_words(serial: &mut SerialDapProbe, address: u32, count: usize) -> Re
     Ok(words.iter().copied().map(u32::from_le_bytes).collect())
 }
 
-/// Works out what is on the wire, rather than trusting what was asked for.
-///
-/// A probe-rs attach succeeds against whatever target name it is handed, so it
-/// cannot answer this; only DBGMCU can.
-pub fn identify(serial: &mut SerialDapProbe) -> Result<(Identity, bool)> {
-    // A target that resets repeatedly — a corrupt or half-written image will do
-    // it — answers nothing to a plain attach, because it is back in reset
-    // before the first transfer lands. Falling back to connect-under-reset is
-    // the difference between "unidentifiable" and "recoverable", so it is
-    // automatic rather than a flag the operator has to know to reach for.
-    match identify_once(serial, false) {
-        Ok(identity) => Ok((identity, false)),
-        Err(_) => identify_once(serial, true).map(|identity| (identity, true)),
-    }
-}
-
-pub fn identify_once(serial: &mut SerialDapProbe, under_reset: bool) -> Result<Identity> {
-    power_up_debug_port(serial, under_reset)?;
-    for candidate in DBGMCU_CANDIDATES {
-        let Ok(words) = read_words(serial, candidate, 1) else {
-            continue;
-        };
-        let idcode = words[0];
-        let dev_id = (idcode & 0xfff) as u16;
-        if dev_id == 0 || dev_id == 0xfff {
-            continue;
-        }
-        let family = FAMILIES
-            .iter()
-            .find(|family| family.dev_id == dev_id && family.dbgmcu == candidate);
-        let (flash_kib, uid) = match family {
-            Some(family) => {
-                let flash = read_words(serial, family.flash_size, 1)
-                    .map(|words| (words[0] & 0xffff) as u16)
-                    .unwrap_or(0);
-                let uid = read_words(serial, family.uid, 3)
-                    .map(|words| [words[0], words[1], words[2]])
-                    .unwrap_or([0; 3]);
-                (flash, uid)
-            }
-            None => (0, [0; 3]),
-        };
-        return Ok(Identity {
-            dev_id,
-            rev_id: (idcode >> 16) as u16,
-            family,
-            flash_kib,
-            uid,
-        });
-    }
-    bail!("no DBGMCU identity register responded; the target may be held in reset")
-}
-
-/// Lowercase hex of a SHA-256 digest, so a backup can be quoted and compared.
-/// Either link the bridge protocol runs over.
-///
-/// The frames, the sequencing and every command are the same; only the bytes'
-/// route differs, so nothing above this needs to know which one is in use.
 pub trait Link: std::io::Read + std::io::Write + Send {}
 impl<T: std::io::Read + std::io::Write + Send> Link for T {}
 

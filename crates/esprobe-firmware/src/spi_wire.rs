@@ -18,7 +18,7 @@
 
 use esp_idf_svc::sys::{periph_module_enable, periph_module_t_PERIPH_SPI2_MODULE};
 
-use esprobe_firmware::spi_clock::{self, SOURCE_CLOCK_HZ};
+use crate::spi_clock::{self, SOURCE_CLOCK_HZ};
 
 const SPI2_BASE: u32 = 0x6002_4000;
 const SPI_CMD: u32 = 0x00;
@@ -116,8 +116,9 @@ impl SpiWire {
         write_reg(SPI_USER1, 0);
         write_reg(SPI_USER2, 0);
         write_reg(SPI_DMA_CONF, 0);
-        // No CS pin is driven: SWD has no chip select and the analog switch owns pad
-        // selection. ck_idle_edge stays clear, so SWCLK rests low.
+        // No CS pin is driven: SWD has no chip select, and anything a board
+        // puts between these pads and its targets is that board's to switch.
+        // ck_idle_edge stays clear, so SWCLK rests low.
         write_reg(SPI_MISC, MISC_CS_DIS_ALL);
 
         let mut wire = Self {
