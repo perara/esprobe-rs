@@ -34,15 +34,22 @@ over the cable the access point exists to replace.
 Any four pins will do; the map is a build-time constant, defaulting to the
 assignment below.
 
-| Signal | Default |
-| --- | ---: |
-| `PROG_SWDIO` | GPIO1 |
-| `PROG_SWCLK` | GPIO2 |
-| `RESET_ALL` | GPIO21 |
+| Signal | Default | What it is |
+| --- | ---: | --- |
+| `SWDIO` | GPIO1 | debug data |
+| `SWCLK` | GPIO2 | debug clock |
+| `RESET` | GPIO21 | driven low to hold reset, released otherwise |
+| `UART_TX` | GPIO3 | to the target's receiver — optional |
+| `UART_RX` | GPIO4 | from the target's transmitter — optional |
 
 ```bash
-PIN_SWDIO=1 PIN_SWCLK=2 PIN_RESET_ALL=21 ./scripts/build.sh
+PIN_SWDIO=1 PIN_SWCLK=2 PIN_RESET=21 PIN_UART_TX=3 PIN_UART_RX=4 \
+  ./scripts/build.sh
 ```
+
+`RESET` is never driven high — the target's own pull-up sets that level, so a
+board whose target is unpowered is not back-fed through this pin. The UART pair
+is optional; leave it on unused pins if the target has no serial console.
 
 **Avoid GPIO2, GPIO8 and GPIO9 for SWCLK.** They are ESP32-C3 strapping pins,
 sampled at reset. A target that holds SWCLK low at power-up — held in reset,
@@ -57,95 +64,21 @@ board this grew up on heated an analog switch until it had to be replaced.
 `esprobe pin-map` asks the running firmware what it was built for, so the map
 can be checked rather than assumed.
 
-## Board-specific extras
+## Building for a board that is more than a probe
 
-This firmware began as the control hub for one particular board, and still
-carries parts that only make sense there: a analog switch mux for selecting between
-four SWD targets, a display UART bridge, and the HTTP endpoints that drive
-them. They are harmless if the pins are unused, and will be feature-gated
-rather than left as permanent furniture. The rest of the HTTP API — liveness,
-identify, program — works on any board; see [HTTP control API](#http-control-api).
+This firmware is only the probe. A board that puts something else beside the
+debug port — an analog switch selecting between targets, a motor, a second
+radio — does not patch this crate; it depends on it and adds its own.
 
-## Board-specific pin map
+`esprobe-protocol` reserves opcodes `0x80..=0xfe` for exactly that, so a
+product's commands ride the same link as the probe's own and a future release
+here cannot collide with them. A bare probe answers `Unsupported` to all of
+them. `pin-map` reports this firmware's five pins first and anything a board
+appends after, positionally — only that board's firmware knows what they are.
 
-The defaults are revision 2, which is what `esprobe pin-map` reports off a
-board. They were the v1.0 schematic for a long time after the hardware moved,
-because every deployed image was built with `PIN_*` overrides and nothing
-compared the two — so reading the source to find which pin a signal was on gave
-the wrong answer. `the_default_pinmap_is_what_a_board_reports` now fails if they
-drift apart again.
-
-| Signal | ESP32-C3 | v1.0 was |
-| --- | ---: | ---: |
-| `STEP_BIN1` | GPIO0 | — |
-| `PROG_SWDIO` | GPIO1 | GPIO4 |
-| `PROG_SWCLK` | GPIO2 | GPIO3 |
-| `DISP_RX` | GPIO3 | GPIO6 |
-| `DISP_TX` | GPIO4 | GPIO5 |
-| `STEP_BIN2` | GPIO5 | — |
-| `STEP_AIN2` | GPIO6 | — |
-| `STEP_AIN1` | GPIO7 | — |
-| `ASW_S0` | GPIO10 | GPIO1 |
-| `ASW_S1` | GPIO20 | GPIO2 |
-| `RESET_ALL` (originally supplied as `AUX_0_RST`) | GPIO21 | GPIO7 |
-
-A v1.0 board still builds:
-
-```bash
-PIN_SWDIO=4 PIN_SWCLK=3 PIN_RESET_ALL=7 PIN_ASW_S0=1 PIN_ASW_S1=2 \
-  PIN_DISP_TX=5 PIN_DISP_RX=6 ./scripts/build.sh
-```
-
-GPIO12-17 are the SPI flash and GPIO18/19 are the USB pair the probe is reached
-over; a test rejects any claimed pin in either range, because driving one of
-those does not produce a signal, it produces a brick.
-
-## The actuator station
-
-Four of the pins revision 2 left free drive a motor driver, one H-bridge per winding:
-`AIN1`/`AIN2` on GPIO7/GPIO6 for coil A, `BIN1`/`BIN2` on GPIO0/GPIO5 for coil
-B. The two halves of a winding must stay on the same bridge — swapping the two
-inputs of one bridge reverses that winding, and the motor buzzes instead of
-turning.
-
-Open `http://<probe>/actuator` for a control page: drag left or right to jog, let go
-to stop. The page is served from flash by the same HTTP server as the API, in
-one file with no external references — the board is reached over its own
-access point, which has no route to a CDN, so a page that pulled a framework
-would be a blank rectangle exactly when it is needed. It carries an ETag derived
-from its own bytes, so a reload costs a 304 rather than nine kilobytes over the
-link that is also carrying the jog commands.
-
-Three host tests keep it that way: that it references nothing outside the
-station, that it only calls routes the firmware serves, and that it stays inside
-a size budget. The page is the one part that cannot be checked by running it —
-there is no browser on the bench — so what can be checked is checked.
-
-Or drive it directly:
-
-| Route | Method | Body |
-| --- | --- | --- |
-| `/api/v1/actuator` | GET | — |
-| `/api/v1/actuator/jog` | POST | `{"steps_per_s":-250}` |
-| `/api/v1/actuator/move` | POST | `{"steps":200,"steps_per_s":400}` |
-| `/api/v1/actuator/stop` | POST | — |
-| `/api/v1/actuator/release` | POST | — |
-
-Two things it does on its own, both because a motor driver has no current chopping
-and a actuator standing still with its windings energised is a resistor:
-
-- **It lets go.** After the last step it holds position for 400 ms and then
-  coasts. A station needing indefinite holding torque needs a driver that can
-  limit current, not a longer timeout.
-- **A jog expires.** `jog` is honoured for 400 ms and must be refreshed. If the
-  browser tab closes or the Wi-Fi drops mid-drag, the last thing the firmware
-  heard was "keep going" — and a actuator that keeps going because nobody said
-  stop is how a board drives itself into its end stop.
-
-GPIO3 and GPIO4 are not ESP32-C3 strapping pins. GPIO4 is also a pad-JTAG
-signal at reset; firmware explicitly claims it as GPIO SWDIO while the
-control-hub host connection continues to use the separate USB Serial/JTAG
-controller.
+This crate used to carry one such board itself: a four-way analog switch, a
+motor driver, a control page, and a vendor's flash programmer. It does not any
+more, and the pin map above is the whole of what it claims.
 
 ## Build and flash
 
@@ -215,7 +148,8 @@ storage-side cause of exactly that symptom.
 The host tool is [`crates/esprobe`](../esprobe). It is a probe-rs *backend*, not a
 reimplementation: ADIv5, the vendor debug sequences, the chip database and the
 CMSIS-Pack flash algorithms are all probe-rs's, reached through the standard
-`DebugProbe`/`RawDapAccess` traits. Programming an STM32G071 needed no
+`DebugProbe`/`RawDapAccess` traits. There is no vendor code here — programming
+any supported part needs no
 G0 flash-controller code here at all.
 
 The one thing probe-rs cannot supply is knowing this bridge exists, so
@@ -251,10 +185,10 @@ against the bridge's reset commands, so `probe.attach_under_reset()` — probe-r
 own connect-under-reset — works instead of a bespoke flag doing the same job
 worse. Two things had to be true for that:
 
-- `ResetAssert` must not touch the mux or the SWD link. A debug sequence
-  asserts reset *after* attaching, so tearing the link down underneath it fails
-  the very next transfer. `RESET_ALL` reaches every target regardless of where
-  the mux points, so selecting one was never needed.
+- `ResetAssert` must not touch the SWD link. A debug sequence asserts reset
+  *after* attaching, so tearing the link down underneath it fails the very next
+  transfer. Reset is its own net and reaching it never required disturbing the
+  debug port.
 - The reset guard covers bulk memory reads only, never raw DP/AP access.
   Connect-under-reset is *built* on talking to the debug port while reset is
   asserted; guarding that would break the recovery path the guard exists to
@@ -271,12 +205,11 @@ read through probe-rs's chunking manages 77 KiB/s.
 Two things are established by measurement rather than assumption, because
 getting either wrong is expensive.
 
-**The GPIO map is a build-time constant**, defaulting to the v1.0 schematic and
-overridden per board:
+**The GPIO map is a build-time constant**, overridden per board:
 
 ```bash
-PIN_SWDIO=1 PIN_SWCLK=2 PIN_RESET_ALL=21 \
-  PIN_ASW_S0=10 PIN_ASW_S1=20 PIN_DISP_TX=3 PIN_DISP_RX=4 ./scripts/build.sh
+PIN_SWDIO=1 PIN_SWCLK=2 PIN_RESET=21 PIN_UART_TX=3 PIN_UART_RX=4 \
+  ./scripts/build.sh
 ```
 
 It cannot be a runtime setting: the pins are claimed and driven during
@@ -290,13 +223,12 @@ assumed.
 
 **The target is identified from its own registers.** `probe-rs attach` succeeds
 against whatever target name it is handed — the same board attached happily as
-`STM32G030K8`, `STM32G071RBTx` and `STM32G081RBTx` — so it cannot answer what a
+three different names for one part — so it cannot answer what a
 chip is. Only DBGMCU can:
 
 ```bash
 cargo run -- identify
-# dev_id=0x460 rev_id=0x2001 family=STM32G07x/G08x flash=128 KiB uid=...
-# probe_rs_target=STM32G071RBTx
+# dp_id=0x0bc11477 designer=0x23b part=0xc1 rev=0 dp_version=1 minimal=false
 ```
 
 `--target` is optional and detection runs when it is omitted. DBGMCU is read at
@@ -366,7 +298,6 @@ cargo run -- probe
 cargo run -- probe-under-reset
 cargo run -- recovery-probe
 cargo run -- recovery-probe --delay-us 1000
-cargo run -- mux-scan
 cargo run -- uart-receive
 cargo run -- uart-reset-capture
 cargo run -- uart-reset-capture --swapped
@@ -408,13 +339,13 @@ backend's actual bit placement can be read off rather than assumed.
 
 `lines` releases both ESP pins to inputs and reports their physical idle
 levels. A powered/reset STM32 normally presents SWDIO high and SWCLK low;
-`reset-lines` performs the same passive sampling while `RESET_ALL` is held
+`reset-lines` performs the same passive sampling while reset is held
 low and again after release, without producing any SWD clock;
 `reset-assert` holds the shared reset net low for meter measurements until
 `reset-release` or an ESP reboot returns GPIO7 to high impedance. This resets
 the STM32 and both AUX modules. `reset-cycle` alternates between those states
-and releases RESET_ALL when Ctrl-C stops it;
-`swdio=0` is a fail-closed indication to check target/mux power and wiring. The firmware
+and releases reset when Ctrl-C stops it;
+`swdio=0` is a fail-closed indication to check target power and wiring. The firmware
 refuses to start an SWD transaction when released SWDIO is low (bridge
 diagnostic detail `04`), limits both programming pads to the ESP32-C3's 5 mA
 drive-strength setting, and releases both pads before preloading their output
@@ -424,7 +355,7 @@ path electrically safe.
 
 `probe-under-reset` is an explicit recovery path for a powered target that was
 previously programmed successfully but leaves SWDIO passive-low. It asserts
-RESET_ALL, prepares the SWD pin state, releases reset to the board pull-up, and
+reset, prepares the SWD pin state, releases it to the target's pull-up, and
 attaches immediately before application firmware can reclaim PA13/PA14. It
 never enables STM32 erase or programming by itself.
 
@@ -436,13 +367,13 @@ passive capture, while `uart-reset-capture` resets and captures startup bytes
 atomically so host reconnection cannot miss them. An empty response is not a
 successful bootloader handshake; ROM flashing must require ACK `0x79`.
 
-`mux-scan` verifies the physical GPIO1/GPIO2 selector levels, passively
+`lines` verifies the released pad levels, passively
 samples all four U14 channels, and performs read-only DP identification only
 on STM32/AUX channels whose released SWDIO is high. It always restores the
 all-low STM32 selection. `recovery-probe --delay-us` permits a bounded sweep
 across the reset-RC/application-start window without rebuilding firmware.
 `uart-reset-capture --swapped` is passive and exists only to exclude reversed
-display-net direction during bring-up.
+serial-line direction during bring-up.
 
 ## Wire speed
 
@@ -569,13 +500,13 @@ clock is repaid at the trailing one. `leading_turnaround` and
 `trailing_turnaround` exist so each backend can state that for itself.
 
 Raise the clock only after repeated identity reads succeed on the assembled
-board; through the analog switch the mux settling time, not the engine, sets the
+board; through an analog switch its settling time, not the engine, sets the
 ceiling.
 
-On the original board, at boot GPIO5 display TX, GPIO7 `RESET_ALL`, GPIO4
-SWDIO, and GPIO3 SWCLK remain inputs. The mux selectors use the all-low STM32 position. Any operation
+On one board, at boot GPIO5 serial TX, GPIO7 reset, GPIO4
+SWDIO, and GPIO3 SWCLK remain inputs. Any operation
 that would drive a high level first reselects STM32 and requires its released
-SWDIO pull-up to be visible. Display TX is enabled only for the duration of a
+SWDIO pull-up to be visible. Serial TX is enabled only for the duration of a
 power-gated transmission, and GPIO7 asserts reset low before returning to an
 input so the carrier board's 10 kΩ pull-up performs the release.
 
@@ -604,30 +535,9 @@ curl --data-binary @firmware.bin \
   http://PROBE_IP/api/v1/stm32/flash               # program it
 ```
 
-### Endpoints specific to the board this came from
-
-This firmware grew on an carrier board that puts a analog switch analog
-multiplexer between the ESP32-C3's SWD pins and four targets, and a UART to a
-display. Those endpoints are still served, and are inert on a plain devkit —
-`RESET_ALL` is the only pin they touch that a three-wire setup has.
-
-```bash
-curl -X POST http://PROBE_IP/api/v1/mux/stm32      # point the mux at a target
-curl -X POST http://PROBE_IP/api/v1/mux/aux2        # ...or the others
-curl -X POST http://PROBE_IP/api/v1/aux0/reset     # compatibility path: RESET_ALL
-curl --data-binary @frame.bin http://PROBE_IP/api/v1/display/tx
-curl http://PROBE_IP/api/v1/display/rx --output received.bin
-```
-
-The flash endpoint accepts a raw binary linked at `0x08000000`, rejects empty
-or oversized images, requires exact STM32G03x/04x device ID `0x466`, halts the
-core, page-erases only the image range, writes 64-bit flash units, compares the
-complete uploaded range, locks flash, requests a core reset, and releases
-SWDIO/SWCLK to high impedance.
-
 ## Validation boundary
 
-Host tests prove pin constants, mux truth table, framing/CRC behavior, and
+Host tests prove pin constants, framing/CRC behavior, and
 hardware-neutral SWD/flash logic. A successful USB handshake proves only that
 the ESP bridge is alive. A probe-rs attach proves target-side SWD transactions;
 programming plus enabled readback verification proves the downloaded image.

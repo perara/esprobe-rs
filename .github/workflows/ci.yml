@@ -22,20 +22,32 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --release
 
-  firmware-format:
-    name: Firmware formatting
+  firmware:
+    name: Firmware formatting and host tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
+      - uses: Swatinem/rust-cache@v2
       # The firmware is excluded from the workspace and cross-compiles for
-      # riscv32imc-esp-espidf against a generated ESP-IDF, which cannot be
-      # built here; its dependencies do not compile for the host at all. Its
-      # formatting can still be checked, and is, because that is the part that
-      # otherwise drifts silently between hardware sessions.
+      # riscv32imc-esp-espidf against a generated ESP-IDF, which cannot be built
+      # here. Formatting can still be checked, and is, because that is the part
+      # that otherwise drifts silently between hardware sessions.
       - run: cargo fmt --check
+        working-directory: crates/esprobe-firmware
+
+      # The hardware-neutral half *is* testable here, and was not being tested.
+      # `.cargo/config.toml` sets the espidf target for every build in that
+      # directory, so a plain `cargo test` cross-compiles and fails on the
+      # ESP-IDF dependencies; naming the host target explicitly builds only the
+      # modules that are not behind `cfg(target_os = "espidf")`.
+      #
+      # This is not hypothetical hygiene. A pin-map test sat failing for weeks
+      # because the serial pins' roles were corrected in the constants and not
+      # in the expectation pinning them, and nothing ever ran it.
+      - run: cargo test --lib --target x86_64-unknown-linux-gnu
         working-directory: crates/esprobe-firmware
 
   msrv:

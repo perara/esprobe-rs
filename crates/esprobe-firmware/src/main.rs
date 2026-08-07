@@ -12,17 +12,17 @@ mod app {
     use std::time::Duration;
 
     use anyhow::{Context, Result, anyhow};
-    use embedded_svc::http::{Headers as _, Method};
-    use embedded_svc::io::{Read as _, Write as _};
+    use embedded_svc::http::Method;
+    use embedded_svc::io::Write as _;
     use embedded_svc::wifi::{
         AccessPointConfiguration, AuthMethod, ClientConfiguration, Configuration, PmfConfiguration,
         ScanMethod, ScanSortMethod,
     };
     use esp_idf_svc::eventloop::EspSystemEventLoop;
     use esp_idf_svc::hal::delay::Ets;
+    use esp_idf_svc::hal::delay::TickType;
     use esp_idf_svc::hal::gpio::{AnyIOPin, InputOutput, PinDriver, Pull};
     use esp_idf_svc::hal::peripherals::Peripherals;
-    use esp_idf_svc::hal::delay::TickType;
     use esp_idf_svc::hal::uart::{
         UartDriver,
         config::{Config as UartConfig, Parity},
@@ -31,9 +31,8 @@ mod app {
     use esp_idf_svc::http::server::EspHttpServer;
     use esp_idf_svc::nvs::EspDefaultNvsPartition;
     use esp_idf_svc::sys::{
-        UART_PIN_NO_CHANGE, gpio_get_level, gpio_mode_t_GPIO_MODE_INPUT,
-        gpio_mode_t_GPIO_MODE_OUTPUT, gpio_reset_pin, gpio_set_direction, uart_port_t_UART_NUM_1,
-        uart_set_pin,
+        UART_PIN_NO_CHANGE, gpio_mode_t_GPIO_MODE_INPUT, gpio_mode_t_GPIO_MODE_OUTPUT,
+        gpio_reset_pin, gpio_set_direction, uart_port_t_UART_NUM_1, uart_set_pin,
     };
     use esp_idf_svc::wifi::{BlockingWifi, EspWifi, WifiEvent};
     use log::{error, info, warn};
@@ -70,7 +69,6 @@ mod app {
     const NVS_TX_POWER: &str = "txpower";
     const NVS_SSID: &str = "sta_ssid";
     const NVS_PASSWORD: &str = "sta_pass";
-    const MAX_DISPLAY_FRAME: usize = 1024;
     /// Set when the bench harness has SWDIO and SWCLK crossed. The bridge's
     /// `SetPinMap` command overrides this at runtime.
     const SWD_PINS_SWAPPED: bool = option_env!("SWD_PINS_SWAPPED").is_some();
@@ -217,15 +215,6 @@ mod app {
             Ok(())
         }
 
-        fn pulse_reset(&mut self) -> Result<()> {
-            anyhow::ensure!(
-                self.reset.is_high(),
-                "the target's reset pull-up is not visible"
-            );
-            self.pulse_reset_low_release()?;
-            Ok(())
-        }
-
         fn bridge_command(
             &mut self,
             command: BridgeCommand,
@@ -302,8 +291,7 @@ mod app {
                     Ok(4)
                 }
                 BridgeCommand::Attach => {
-                    self.release_pads()
-                        .map_err(|_| SwdError::Protocol(0))?;
+                    self.release_pads().map_err(|_| SwdError::Protocol(0))?;
                     let (mut swdio, _) = self
                         .swd
                         .as_mut()
@@ -337,14 +325,11 @@ mod app {
                     Ok(0)
                 }
                 BridgeCommand::AttachUnderReset => {
-                    self.release_pads()
-                        .map_err(|_| SwdError::Protocol(0))?;
+                    self.release_pads().map_err(|_| SwdError::Protocol(0))?;
                     if self.swd.is_none() {
                         return Err(SwdError::Protocol(0));
                     }
-                    self.reset
-                        .set_low()
-                        .map_err(|_| SwdError::Protocol(0))?;
+                    self.reset.set_low().map_err(|_| SwdError::Protocol(0))?;
                     self.hold_reset(true).map_err(|_| SwdError::Protocol(0))?;
                     thread::sleep(Duration::from_millis(10));
                     self.swd
@@ -361,14 +346,11 @@ mod app {
                     Ok(0)
                 }
                 BridgeCommand::PadSelfTest => {
-                    self.release_pads()
-                        .map_err(|_| SwdError::Protocol(0))?;
+                    self.release_pads().map_err(|_| SwdError::Protocol(0))?;
                     if self.swd.is_none() {
                         return Err(SwdError::Protocol(0));
                     }
-                    self.reset
-                        .set_low()
-                        .map_err(|_| SwdError::Protocol(0))?;
+                    self.reset.set_low().map_err(|_| SwdError::Protocol(0))?;
                     self.hold_reset(true).map_err(|_| SwdError::Protocol(0))?;
                     thread::sleep(Duration::from_millis(10));
                     let levels = self
@@ -387,8 +369,7 @@ mod app {
                         [low, high] => u16::from_le_bytes([*low, *high]),
                         _ => return Err(SwdError::Protocol(0)),
                     };
-                    self.release_pads()
-                        .map_err(|_| SwdError::Protocol(0))?;
+                    self.release_pads().map_err(|_| SwdError::Protocol(0))?;
                     if self.swd.is_none() {
                         return Err(SwdError::Protocol(0));
                     }
@@ -399,9 +380,7 @@ mod app {
                     // every later read returns zeros and looks like a blank
                     // device rather than an error.
                     let outcome = (|| {
-                        self.reset
-                            .set_low()
-                            .map_err(|_| SwdError::Protocol(0))?;
+                        self.reset.set_low().map_err(|_| SwdError::Protocol(0))?;
                         self.hold_reset(true).map_err(|_| SwdError::Protocol(0))?;
                         thread::sleep(Duration::from_millis(10));
                         self.swd
@@ -434,11 +413,8 @@ mod app {
                     let [level] = payload else {
                         return Err(SwdError::Protocol(0));
                     };
-                    self.release_pads()
-                        .map_err(|_| SwdError::Protocol(0))?;
-                    self.reset
-                        .set_low()
-                        .map_err(|_| SwdError::Protocol(0))?;
+                    self.release_pads().map_err(|_| SwdError::Protocol(0))?;
+                    self.reset.set_low().map_err(|_| SwdError::Protocol(0))?;
                     self.hold_reset(true).map_err(|_| SwdError::Protocol(0))?;
                     let observed = self
                         .swd
@@ -452,6 +428,18 @@ mod app {
                     // Write to the target's UART and capture whatever it
                     // answers, in one round trip. The plane is request/response,
                     // so a separate receive would race the reply.
+                    //
+                    // Driving TX into an unpowered target back-feeds its supply
+                    // through the pad's protection diode, which is the same
+                    // hazard the debug pads have and takes the same evidence to
+                    // rule out. Checked only when nothing is attached: proving
+                    // it means releasing the pads to sample them, and doing
+                    // that mid-session would tear down a live debug link for
+                    // the sake of a serial write.
+                    if !self.bridge_attached {
+                        self.require_target_power()
+                            .map_err(|_| SwdError::LineHeldLow)?;
+                    }
                     self.uart
                         .change_parity(Parity::ParityNone)
                         .map_err(|_| SwdError::Protocol(0))?;
@@ -468,10 +456,7 @@ mod app {
                     drained.map_err(|_| SwdError::Protocol(0))?;
                     // Ten bytes are reserved by the bridge envelope.
                     let capacity = response.len().min(BRIDGE_MAX_FRAME - 10);
-                    Ok(self
-                        .uart
-                        .read(&mut response[..capacity], 200)
-                        .unwrap_or(0))
+                    Ok(self.uart.read(&mut response[..capacity], 200).unwrap_or(0))
                 }
                 BridgeCommand::UartReceive => {
                     // An optional little-endian u16 of milliseconds to listen
@@ -501,13 +486,17 @@ mod app {
                         std::time::Instant::now() + Duration::from_millis(u64::from(window_ms));
                     let mut filled = 0usize;
                     while filled < capacity {
-                        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                        let remaining =
+                            deadline.saturating_duration_since(std::time::Instant::now());
                         if remaining.is_zero() {
                             break;
                         }
                         // This argument is FreeRTOS ticks, not milliseconds.
                         let ticks = TickType::from(remaining).ticks() as u32;
-                        match self.uart.read(&mut response[filled..capacity], ticks.max(1)) {
+                        match self
+                            .uart
+                            .read(&mut response[filled..capacity], ticks.max(1))
+                        {
                             Ok(0) | Err(_) => break,
                             Ok(n) => filled += n,
                         }
@@ -548,10 +537,7 @@ mod app {
                         self.pulse_reset_low_release()
                             .map_err(|_| SwdError::Protocol(0))?;
                         let capacity = response.len().min(BRIDGE_MAX_FRAME - 10);
-                        Ok(self
-                            .uart
-                            .read(&mut response[..capacity], 200)
-                            .unwrap_or(0))
+                        Ok(self.uart.read(&mut response[..capacity], 200).unwrap_or(0))
                     })();
                     let restore = esp_idf_svc::sys::esp!(unsafe {
                         uart_set_pin(
@@ -647,8 +633,7 @@ mod app {
                         [low, high] => u16::from_le_bytes([*low, *high]),
                         _ => return Err(SwdError::Protocol(0)),
                     };
-                    self.release_pads()
-                        .map_err(|_| SwdError::Protocol(0))?;
+                    self.release_pads().map_err(|_| SwdError::Protocol(0))?;
                     let (swdio, swclk) = self
                         .swd
                         .as_mut()
@@ -659,8 +644,7 @@ mod app {
                     Ok(2)
                 }
                 BridgeCommand::WireProbe => {
-                    self.release_pads()
-                        .map_err(|_| SwdError::Protocol(0))?;
+                    self.release_pads().map_err(|_| SwdError::Protocol(0))?;
                     let swd = self.swd.as_mut().ok_or(SwdError::Protocol(0))?;
                     let (first, second) = match payload {
                         [] | [0] => swd.wire_probe(false),
@@ -692,8 +676,7 @@ mod app {
                         ),
                         _ => return Err(SwdError::Protocol(0)),
                     };
-                    self.release_pads()
-                        .map_err(|_| SwdError::Protocol(0))?;
+                    self.release_pads().map_err(|_| SwdError::Protocol(0))?;
                     let swd = self.swd.as_mut().ok_or(SwdError::Protocol(0))?;
                     let (dpidr_ack, write_ack, before, after) =
                         swd.ap_write_handover_probe(value, after_read, before_write);
@@ -835,8 +818,7 @@ mod app {
                     }
                     let bits =
                         u64::from_le_bytes(pattern.try_into().map_err(|_| SwdError::Protocol(0))?);
-                    self.release_pads()
-                        .map_err(|_| SwdError::Protocol(0))?;
+                    self.release_pads().map_err(|_| SwdError::Protocol(0))?;
                     let observed = self
                         .swd
                         .as_mut()
@@ -918,8 +900,7 @@ mod app {
                     Ok(0)
                 }
                 BridgeCommand::LineState => {
-                    self.release_pads()
-                        .map_err(|_| SwdError::Protocol(0))?;
+                    self.release_pads().map_err(|_| SwdError::Protocol(0))?;
                     let (swdio, swclk) = self
                         .swd
                         .as_mut()
@@ -934,11 +915,8 @@ mod app {
                     Ok(3)
                 }
                 BridgeCommand::ResetLineState => {
-                    self.release_pads()
-                        .map_err(|_| SwdError::Protocol(0))?;
-                    self.reset
-                        .set_low()
-                        .map_err(|_| SwdError::Protocol(0))?;
+                    self.release_pads().map_err(|_| SwdError::Protocol(0))?;
+                    self.reset.set_low().map_err(|_| SwdError::Protocol(0))?;
                     self.hold_reset(true).map_err(|_| SwdError::Protocol(0))?;
                     thread::sleep(Duration::from_millis(10));
                     let (asserted_swdio, asserted_swclk) = self
@@ -1162,11 +1140,7 @@ mod app {
         // but not the routing, so the pad drove a constant level - idle high,
         // indistinguishable from a healthy idle line - and not one byte ever
         // left. The far end saw a quiet, error-free, permanently empty wire.
-        let swd = EspSwdIo::new(
-            take(pinmap::SWDIO)?,
-            take(pinmap::SWCLK)?,
-            SWD_PINS_SWAPPED,
-        )?;
+        let swd = EspSwdIo::new(take(pinmap::SWDIO)?, take(pinmap::SWCLK)?, SWD_PINS_SWAPPED)?;
 
         let wifi_control = Arc::new(Mutex::new(WifiControl::default()));
         let hub = Arc::new(Mutex::new(Hub {
@@ -1212,7 +1186,7 @@ mod app {
             lru_purge_enable: true,
             ..Default::default()
         })?;
-        register_handlers(&mut server, hub, wifi_control.clone())?;
+        register_handlers(&mut server, wifi_control.clone())?;
 
         // What the radio should be on, read from storage once. Re-reading it
         // every pass reopened the NVS handle twice a second, which is both
@@ -1801,7 +1775,6 @@ mod app {
     /// on this firmware registers its own routes alongside these.
     fn register_handlers(
         server: &mut EspHttpServer<'static>,
-        hub: Arc<Mutex<Hub>>,
         wifi: Arc<Mutex<WifiControl>>,
     ) -> Result<()> {
         server.fn_handler("/health", Method::Get, move |req| {
@@ -1835,7 +1808,6 @@ mod app {
             response.write_all(body.as_bytes())?;
             Ok::<(), anyhow::Error>(())
         })?;
-
 
         Ok(())
     }
