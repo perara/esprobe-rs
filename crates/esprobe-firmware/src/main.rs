@@ -1054,7 +1054,7 @@ mod app {
     /// The length is the part's GPIO ceiling plus one — indexing it with a pin
     /// the part does not have was a panic at start-up before it was, which is
     /// how the first ESP32 boot ended.
-    #[cfg(not(esp32))]
+    #[cfg(not(any(esp32, esp32s2, esp32s3)))]
     fn numbered_pins(
         pins: esp_idf_svc::hal::gpio::Pins,
     ) -> [Option<AnyIOPin<'static>>; esprobe_firmware::chip::MAX_GPIO as usize + 1] {
@@ -1081,6 +1081,66 @@ mod app {
             Some(pins.gpio19.into()),
             Some(pins.gpio20.into()),
             Some(pins.gpio21.into()),
+        ]
+    }
+
+    /// The ESP32-S2's table. `None` marks a number the package does not offer
+    /// as a drivable pad: GPIO22..=25 are not bonded out, and GPIO46 exists but
+    /// is input-only. The compiler settles which is which — `Pins` has no field
+    /// for a pad that does not exist, and no `From` impl for one that cannot
+    /// drive — so this table cannot quietly claim a pad the part lacks.
+    #[cfg(esp32s2)]
+    fn numbered_pins(
+        pins: esp_idf_svc::hal::gpio::Pins,
+    ) -> [Option<AnyIOPin<'static>>; esprobe_firmware::chip::MAX_GPIO as usize + 1] {
+        [
+            Some(pins.gpio0.into()),
+            Some(pins.gpio1.into()),
+            Some(pins.gpio2.into()),
+            Some(pins.gpio3.into()),
+            Some(pins.gpio4.into()),
+            Some(pins.gpio5.into()),
+            Some(pins.gpio6.into()),
+            Some(pins.gpio7.into()),
+            Some(pins.gpio8.into()),
+            Some(pins.gpio9.into()),
+            Some(pins.gpio10.into()),
+            Some(pins.gpio11.into()),
+            Some(pins.gpio12.into()),
+            Some(pins.gpio13.into()),
+            Some(pins.gpio14.into()),
+            Some(pins.gpio15.into()),
+            Some(pins.gpio16.into()),
+            Some(pins.gpio17.into()),
+            Some(pins.gpio18.into()),
+            Some(pins.gpio19.into()),
+            Some(pins.gpio20.into()),
+            Some(pins.gpio21.into()),
+            None, // GPIO22 is not bonded out
+            None, // GPIO23 is not bonded out
+            None, // GPIO24 is not bonded out
+            None, // GPIO25 is not bonded out
+            Some(pins.gpio26.into()),
+            Some(pins.gpio27.into()),
+            Some(pins.gpio28.into()),
+            Some(pins.gpio29.into()),
+            Some(pins.gpio30.into()),
+            Some(pins.gpio31.into()),
+            Some(pins.gpio32.into()),
+            Some(pins.gpio33.into()),
+            Some(pins.gpio34.into()),
+            Some(pins.gpio35.into()),
+            Some(pins.gpio36.into()),
+            Some(pins.gpio37.into()),
+            Some(pins.gpio38.into()),
+            Some(pins.gpio39.into()),
+            Some(pins.gpio40.into()),
+            Some(pins.gpio41.into()),
+            Some(pins.gpio42.into()),
+            Some(pins.gpio43.into()),
+            Some(pins.gpio44.into()),
+            Some(pins.gpio45.into()),
+            None, // GPIO46 is input-only
         ]
     }
 
@@ -1369,15 +1429,15 @@ mod app {
     /// one, and UART0 where there is not. `serve_bridge` is generic over the
     /// stream, so only the setup differs.
     fn spawn_host_bridge(hub: Arc<Mutex<Hub>>) -> Result<()> {
-        #[cfg(esp32)]
+        #[cfg(any(esp32, esp32s2))]
         {
-            // No USB peripheral on this part. UART0 is the link, and the
+            // No USB Serial/JTAG on this part. UART0 is the link, and the
             // console is configured off in its sdkconfig so that log output
             // cannot interleave with framed bridge traffic — a stray line of
             // text mid-frame is a CRC failure the host has to time out on.
             spawn_uart_bridge(hub)
         }
-        #[cfg(not(esp32))]
+        #[cfg(not(any(esp32, esp32s2)))]
         {
             spawn_usb_bridge(hub)
         }
@@ -1389,13 +1449,13 @@ mod app {
     /// USB-serial chip on the other end, not of this firmware: a CP2102 tops
     /// out near 1 Mbaud, a CP2102N or an FTDI will go several times that, and
     /// the host has to be told the same number either way.
-    #[cfg(esp32)]
+    #[cfg(any(esp32, esp32s2))]
     const UART_BRIDGE_BAUD: i32 = match option_env!("UART_BRIDGE_BAUD") {
         Some(text) => parse_baud(text),
         None => 921_600,
     };
 
-    #[cfg(esp32)]
+    #[cfg(any(esp32, esp32s2))]
     const fn parse_baud(text: &str) -> i32 {
         let bytes = text.as_bytes();
         let mut value = 0i32;
@@ -1413,7 +1473,7 @@ mod app {
         value
     }
 
-    #[cfg(esp32)]
+    #[cfg(any(esp32, esp32s2))]
     fn spawn_uart_bridge(hub: Arc<Mutex<Hub>>) -> Result<()> {
         use esp_idf_svc::sys::{
             uart_config_t, uart_driver_install, uart_param_config, uart_port_t_UART_NUM_0,
@@ -1469,10 +1529,10 @@ mod app {
     }
 
     /// UART0 as a byte stream, for parts with no USB Serial/JTAG.
-    #[cfg(esp32)]
+    #[cfg(any(esp32, esp32s2))]
     struct UartLink;
 
-    #[cfg(esp32)]
+    #[cfg(any(esp32, esp32s2))]
     impl std::io::Read for UartLink {
         fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
             use esp_idf_svc::sys::{
@@ -1510,7 +1570,7 @@ mod app {
         }
     }
 
-    #[cfg(esp32)]
+    #[cfg(any(esp32, esp32s2))]
     impl std::io::Write for UartLink {
         fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
             // SAFETY: `buffer` stays readable for its length; this task is the
@@ -1530,7 +1590,7 @@ mod app {
         }
     }
 
-    #[cfg(not(esp32))]
+    #[cfg(not(any(esp32, esp32s2)))]
     fn spawn_usb_bridge(hub: Arc<Mutex<Hub>>) -> Result<()> {
         let mut config = esp_idf_svc::sys::usb_serial_jtag_driver_config_t {
             // Two full responses must fit, so the wire engine can start the
@@ -1558,10 +1618,10 @@ mod app {
     }
 
     /// The bridge protocol over the ESP32-C3's USB Serial/JTAG endpoint.
-    #[cfg(not(esp32))]
+    #[cfg(not(any(esp32, esp32s2)))]
     struct UsbSerialLink;
 
-    #[cfg(not(esp32))]
+    #[cfg(not(any(esp32, esp32s2)))]
     impl std::io::Read for UsbSerialLink {
         fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
             // SAFETY: `buffer` is writable for its length, and the bridge task
@@ -1577,7 +1637,7 @@ mod app {
         }
     }
 
-    #[cfg(not(esp32))]
+    #[cfg(not(any(esp32, esp32s2)))]
     impl std::io::Write for UsbSerialLink {
         fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
             usb_write_all(buffer);
@@ -1692,7 +1752,7 @@ mod app {
         Ok(())
     }
 
-    #[cfg(not(esp32))]
+    #[cfg(not(any(esp32, esp32s2)))]
     fn usb_write_all(mut bytes: &[u8]) {
         while !bytes.is_empty() {
             // SAFETY: `bytes` remains readable for its reported length. This

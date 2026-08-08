@@ -81,7 +81,10 @@ const fn reserved() -> &'static [(i32, i32, &'static str)] {
     {
         &[
             (27, 32, "the SPI flash this firmware executes from"),
-            (19, 20, "the USB pair the probe is reached over"),
+            (19, 20, "the USB OTG pair"),
+            // No USB Serial/JTAG on this part, so UART0 is the host link and
+            // that pair is as unavailable as the flash.
+            (43, 44, "UART0, the link the probe is reached over"),
         ]
     }
     #[cfg(esp32)]
@@ -131,16 +134,22 @@ const fn default_pins() -> [i32; 5] {
     }
     #[cfg(any(esp32s2, esp32s3))]
     {
-        // Avoids GPIO0/45/46 (strapping), the flash bank, and GPIO19/20 (USB).
+        // Avoids GPIO0/45/46 (strapping), the flash bank, GPIO19/20 (USB) and
+        // GPIO43/44 (UART0, which is the host link on the S2).
         [4, 5, 6, 17, 18]
     }
 }
 
 /// Whether the part is reached by USB Serial/JTAG rather than a UART bridge.
 ///
-/// The original ESP32 has no USB peripheral at all, so its host link is UART0
-/// and the console cannot share it.
-pub const HAS_USB_SERIAL_JTAG: bool = !cfg!(esp32);
+/// Not "has USB": the S2 has a USB OTG peripheral but no USB Serial/JTAG, and
+/// driving OTG needs a device stack this firmware does not carry. The test is
+/// ESP-IDF's `SOC_USB_SERIAL_JTAG_SUPPORTED`, which is 0 for the original
+/// ESP32 and the S2 and 1 for everything since.
+///
+/// Parts without it are reached over UART0, and the console cannot share that
+/// port with framed bridge traffic.
+pub const HAS_USB_SERIAL_JTAG: bool = !cfg!(any(esp32, esp32s2));
 
 /// GPIO-matrix signal indices for the SPI peripheral that clocks the wire.
 ///
@@ -152,9 +161,15 @@ pub const HAS_USB_SERIAL_JTAG: bool = !cfg!(esp32);
 /// on one wire, and the peripheral drives and samples the same pad.
 #[cfg(target_os = "espidf")]
 pub mod signals {
-    #[cfg(any(esp32c3, esp32c6, esp32h2, esp32s2, esp32s3))]
+    #[cfg(any(esp32c3, esp32c6, esp32h2, esp32s3))]
     pub use esp_idf_svc::sys::{
         FSPICLK_OUT_IDX as SPI_CLK_OUT, FSPID_OUT_IDX as SPI_D_OUT, FSPIQ_IN_IDX as SPI_Q_IN,
+    };
+    // The S2 offers the clock only through the matrix's mux index; there is no
+    // plain `FSPICLK_OUT_IDX` on this part.
+    #[cfg(esp32s2)]
+    pub use esp_idf_svc::sys::{
+        FSPICLK_OUT_MUX_IDX as SPI_CLK_OUT, FSPID_OUT_IDX as SPI_D_OUT, FSPIQ_IN_IDX as SPI_Q_IN,
     };
     #[cfg(esp32)]
     pub use esp_idf_svc::sys::{
@@ -165,8 +180,11 @@ pub mod signals {
     // for the block: "SPI2" on the newer parts, "HSPI" on the original ESP32.
     #[cfg(esp32)]
     pub use esp_idf_svc::sys::periph_module_t_PERIPH_HSPI_MODULE as SPI_MODULE;
-    #[cfg(any(esp32c3, esp32c6, esp32h2, esp32s2, esp32s3))]
+    #[cfg(any(esp32c3, esp32c6, esp32h2, esp32s3))]
     pub use esp_idf_svc::sys::periph_module_t_PERIPH_SPI2_MODULE as SPI_MODULE;
+    // Named for the block again: the S2 calls its second SPI "FSPI".
+    #[cfg(esp32s2)]
+    pub use esp_idf_svc::sys::periph_module_t_PERIPH_FSPI_MODULE as SPI_MODULE;
 
     /// Dedicated-GPIO input channels, where the part has them. The original
     /// ESP32 does not, and its pad layer samples the GPIO input register

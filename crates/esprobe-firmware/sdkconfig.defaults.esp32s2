@@ -1,0 +1,5 @@
+# The S2 has a USB OTG peripheral but no USB Serial/JTAG, so the bridge owns
+# UART0 exactly as on the original ESP32 and the console cannot share it.
+CONFIG_ESP_CONSOLE_NONE=y
+CONFIG_ESP_CONSOLE_UART_DEFAULT=n
+CONFIG_FREERTOS_HZ=1000
