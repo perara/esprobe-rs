@@ -283,10 +283,22 @@ impl Transport {
         })
     }
 
+    /// Bit rate for a real UART link, where it matters.
+    ///
+    /// On a native USB endpoint — the C3's USB Serial/JTAG — the baud rate is
+    /// a formality the host and device both ignore. On a part reached through
+    /// a USB-serial chip it is the throughput ceiling, and both ends must
+    /// agree, so it is settable without rebuilding either.
+    pub const DEFAULT_BAUD: u32 = 921_600;
+
     pub fn open(path: &std::path::Path) -> Result<Self> {
-        // The ESP32-C3's USB Serial/JTAG is a native USB endpoint: the baud
-        // rate is a formality, and the frame timeout only bounds a stall.
-        let port = serialport::new(path.to_string_lossy(), 921_600)
+        let baud = std::env::var("ESPROBE_BAUD")
+            .ok()
+            .and_then(|text| text.parse().ok())
+            .unwrap_or(Self::DEFAULT_BAUD);
+        // The frame timeout only bounds a stall; framing carries the integrity
+        // check, so a wrong baud shows up as a timeout rather than bad data.
+        let port = serialport::new(path.to_string_lossy(), baud)
             .timeout(Duration::from_millis(50))
             .open()
             .with_context(|| format!("failed to open {}", path.display()))?;

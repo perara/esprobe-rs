@@ -1383,6 +1383,36 @@ mod app {
         }
     }
 
+    /// Bit rate of the UART host link.
+    ///
+    /// A build-time override because it is a property of the cable and the
+    /// USB-serial chip on the other end, not of this firmware: a CP2102 tops
+    /// out near 1 Mbaud, a CP2102N or an FTDI will go several times that, and
+    /// the host has to be told the same number either way.
+    #[cfg(esp32)]
+    const UART_BRIDGE_BAUD: i32 = match option_env!("UART_BRIDGE_BAUD") {
+        Some(text) => parse_baud(text),
+        None => 921_600,
+    };
+
+    #[cfg(esp32)]
+    const fn parse_baud(text: &str) -> i32 {
+        let bytes = text.as_bytes();
+        let mut value = 0i32;
+        let mut index = 0;
+        while index < bytes.len() {
+            let digit = bytes[index];
+            assert!(
+                digit >= b'0' && digit <= b'9',
+                "UART_BRIDGE_BAUD must be a number"
+            );
+            value = value * 10 + (digit - b'0') as i32;
+            index += 1;
+        }
+        assert!(value >= 9600, "UART_BRIDGE_BAUD is implausibly low");
+        value
+    }
+
     #[cfg(esp32)]
     fn spawn_uart_bridge(hub: Arc<Mutex<Hub>>) -> Result<()> {
         use esp_idf_svc::sys::{
@@ -1392,7 +1422,7 @@ mod app {
         // only has to be fast and 8N1. 921600 is what a CP2102 sustains
         // comfortably; the transport is the limit on this part either way.
         let config = uart_config_t {
-            baud_rate: 921_600,
+            baud_rate: UART_BRIDGE_BAUD,
             data_bits: esp_idf_svc::sys::uart_word_length_t_UART_DATA_8_BITS,
             parity: esp_idf_svc::sys::uart_parity_t_UART_PARITY_DISABLE,
             stop_bits: esp_idf_svc::sys::uart_stop_bits_t_UART_STOP_BITS_1,
@@ -1411,6 +1441,20 @@ mod app {
                 core::ptr::null_mut(),
                 0,
             ))?;
+            // How long the receiver waits for more before handing what it has
+            // to the driver, in symbol times. The default is tens of symbols,
+            // which on a request/response link is dead time on every command:
+            // the request is complete, the peripheral is simply not convinced
+            // yet.
+            //
+            // Deliberately not fatal. It is a tuning call on a link that works
+            // without it, the accepted range is part-specific, and a rejected
+            // value taking the whole bridge down — silently, on a part with no
+            // console — is a far worse outcome than a slightly lazier receiver.
+            let tuned = esp_idf_svc::sys::uart_set_rx_timeout(uart_port_t_UART_NUM_0, 1);
+            if tuned != esp_idf_svc::sys::ESP_OK {
+                warn!("uart_set_rx_timeout was refused ({tuned}); receiver keeps its default");
+            }
         }
         thread::Builder::new()
             .name("uart-dap-bridge".into())

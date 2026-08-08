@@ -121,6 +121,30 @@ It has **more strapping pins**, and its default pin map avoids all of them:
 SWDIO on GPIO21, SWCLK on GPIO22, reset on GPIO23. Do not move those onto
 GPIO0, 2, 5, 12 or 15.
 
+### How fast the UART link goes, and why
+
+Measured on this board, a CP2102 at 921600:
+
+| | ESP32 (UART) | ESP32-C3 (USB Serial/JTAG) |
+| --- | ---: | ---: |
+| round trip | 1.0 ms | 0.19 ms |
+| bulk, 4000-byte frames | 84.9 KiB/s | 630 KiB/s |
+
+Both ESP32 figures are the *cable*, not the firmware, and neither is worth
+attacking in software:
+
+- **84.9 KiB/s is 94% of what 921600 8N1 can carry.** 1000000 and 1500000 were
+  tried on this adapter and do not enumerate — a CP2102 tops out at 921600,
+  where a CP2102N or an FTDI would go several times higher. `UART_BRIDGE_BAUD`
+  at build time and `ESPROBE_BAUD` on the host set both ends; they must agree.
+- **1 ms is the USB frame interval.** A USB-serial bridge answers on the next
+  host poll, and full-speed USB polls every millisecond. Lowering the receiver's
+  idle timeout and raising the FreeRTOS tick to 1 kHz both changed nothing,
+  which is how this was identified rather than guessed.
+
+Wi-Fi is not a way round it: the network transport measures slower than the
+UART on this part.
+
 ### A target on GPIO2 stops the board being flashed
 
 Boot mode is strapped from GPIO0 and GPIO2 together, sampled at reset:
