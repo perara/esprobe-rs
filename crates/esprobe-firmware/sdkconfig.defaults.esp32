@@ -4,3 +4,8 @@
 # out, and it would happen exactly when something interesting was being logged.
 CONFIG_ESP_CONSOLE_NONE=y
 CONFIG_ESP_CONSOLE_UART_DEFAULT=n
+
+# A FreeRTOS tick of 100 Hz makes the smallest blocking wait 10 ms, which on a
+# request/response link is 10 ms of latency per command. At 1 kHz the same wait
+# is 1 ms. The bridge is the only latency-sensitive thing this firmware does.
+CONFIG_FREERTOS_HZ=1000

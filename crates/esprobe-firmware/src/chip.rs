@@ -109,9 +109,14 @@ const fn default_pins() -> [i32; 5] {
     }
     #[cfg(esp32)]
     {
+        // SWDIO GPIO21, SWCLK GPIO4, reset GPIO23, then the target UART.
+        //
         // Avoids GPIO0/2/5/12/15 (strapping), GPIO6..=11 (flash) and
-        // GPIO1/GPIO3 (UART0, which is the host link on this part).
-        [21, 22, 23, 17, 16]
+        // GPIO1/GPIO3 (UART0, which is the host link on this part). GPIO4 in
+        // particular is *not* strapped, which is the whole point: a target
+        // holding the clock line at reset is what stops this part entering
+        // download mode, and GPIO2 — the C3's default — does exactly that.
+        [21, 4, 23, 17, 16]
     }
     #[cfg(any(esp32s2, esp32s3))]
     {

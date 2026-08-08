@@ -1045,7 +1045,19 @@ mod app {
     /// `Pins` names each pad as a distinct type, which is exactly wrong for a
     /// map that is chosen at build time; taking each one once out of this
     /// table keeps the compiler's guarantee that a pad is claimed only once.
-    fn numbered_pins(pins: esp_idf_svc::hal::gpio::Pins) -> [Option<AnyIOPin<'static>>; 22] {
+    /// One entry per GPIO number, so a build-time pin map can be indexed.
+    ///
+    /// `Pins` names each pad as a distinct type, which is exactly wrong for a
+    /// map that is chosen at build time; taking each one once out of this
+    /// table keeps the compiler's guarantee that a pad is claimed only once.
+    ///
+    /// The length is the part's GPIO ceiling plus one — indexing it with a pin
+    /// the part does not have was a panic at start-up before it was, which is
+    /// how the first ESP32 boot ended.
+    #[cfg(not(esp32))]
+    fn numbered_pins(
+        pins: esp_idf_svc::hal::gpio::Pins,
+    ) -> [Option<AnyIOPin<'static>>; esprobe_firmware::chip::MAX_GPIO as usize + 1] {
         [
             Some(pins.gpio0.into()),
             Some(pins.gpio1.into()),
@@ -1069,6 +1081,59 @@ mod app {
             Some(pins.gpio19.into()),
             Some(pins.gpio20.into()),
             Some(pins.gpio21.into()),
+        ]
+    }
+
+    /// The ESP32's table. `None` marks a number the package does not offer as
+    /// a drivable pad: GPIO20, 24 and 28..=31 are not bonded out, and
+    /// GPIO34..=39 exist but are input-only. Claiming one of those fails with
+    /// "claimed by two signals", which is not the reason but is at least a
+    /// refusal rather than a pad that silently never moves.
+    #[cfg(esp32)]
+    fn numbered_pins(
+        pins: esp_idf_svc::hal::gpio::Pins,
+    ) -> [Option<AnyIOPin<'static>>; esprobe_firmware::chip::MAX_GPIO as usize + 1] {
+        [
+            Some(pins.gpio0.into()),
+            Some(pins.gpio1.into()),
+            Some(pins.gpio2.into()),
+            Some(pins.gpio3.into()),
+            Some(pins.gpio4.into()),
+            Some(pins.gpio5.into()),
+            Some(pins.gpio6.into()),
+            Some(pins.gpio7.into()),
+            Some(pins.gpio8.into()),
+            Some(pins.gpio9.into()),
+            Some(pins.gpio10.into()),
+            Some(pins.gpio11.into()),
+            Some(pins.gpio12.into()),
+            Some(pins.gpio13.into()),
+            Some(pins.gpio14.into()),
+            Some(pins.gpio15.into()),
+            Some(pins.gpio16.into()),
+            Some(pins.gpio17.into()),
+            Some(pins.gpio18.into()),
+            Some(pins.gpio19.into()),
+            None, // GPIO20 is not bonded out
+            Some(pins.gpio21.into()),
+            Some(pins.gpio22.into()),
+            Some(pins.gpio23.into()),
+            None, // GPIO24 is not bonded out
+            Some(pins.gpio25.into()),
+            Some(pins.gpio26.into()),
+            Some(pins.gpio27.into()),
+            None, // GPIO28 is not bonded out
+            None, // GPIO29 is not bonded out
+            None, // GPIO30 is not bonded out
+            None, // GPIO31 is not bonded out
+            Some(pins.gpio32.into()),
+            Some(pins.gpio33.into()),
+            None, // GPIO34 is input-only
+            None, // GPIO35 is input-only
+            None, // GPIO36 is input-only
+            None, // GPIO37 is input-only
+            None, // GPIO38 is input-only
+            None, // GPIO39 is input-only
         ]
     }
 
@@ -1366,14 +1431,35 @@ mod app {
     #[cfg(esp32)]
     impl std::io::Read for UartLink {
         fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-            // SAFETY: `buffer` is writable for its length and this task is the
-            // driver's only reader.
+            use esp_idf_svc::sys::{
+                uart_get_buffered_data_len, uart_port_t_UART_NUM_0, uart_read_bytes,
+            };
+            // `uart_read_bytes` waits for the *whole* length asked for, or the
+            // timeout — it does not return early on a short burst. Asking for a
+            // chunk-sized read therefore costs the full timeout on every
+            // request, because a request is a dozen bytes and a chunk is 256.
+            // That was 100 ms per round trip, all of it waiting for bytes that
+            // were already delivered.
+            //
+            // So: take what is buffered, and only block when there is nothing.
+            let mut buffered = 0usize;
+            // SAFETY: the port is open and `buffered` is a valid out-pointer.
+            unsafe { uart_get_buffered_data_len(uart_port_t_UART_NUM_0, &mut buffered) };
+            let want = if buffered == 0 {
+                // Nothing yet. Block for a single byte so the task sleeps
+                // instead of spinning, and let the next pass drain the rest.
+                1
+            } else {
+                buffered.min(buffer.len())
+            };
+            // SAFETY: `buffer` is writable for `want` <= its length, and this
+            // task is the driver's only reader.
             let read = unsafe {
-                esp_idf_svc::sys::uart_read_bytes(
-                    esp_idf_svc::sys::uart_port_t_UART_NUM_0,
+                uart_read_bytes(
+                    uart_port_t_UART_NUM_0,
                     buffer.as_mut_ptr().cast(),
-                    buffer.len() as u32,
-                    10,
+                    want as u32,
+                    if buffered == 0 { 1 } else { 0 },
                 )
             };
             Ok(read.max(0) as usize)
