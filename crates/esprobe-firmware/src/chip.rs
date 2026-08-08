@@ -75,12 +75,90 @@ const fn reserved() -> &'static [(i32, i32, &'static str)] {
     }
     #[cfg(esp32)]
     {
-        // No USB peripheral at all — the original ESP32 is reached over a UART
-        // bridge, so only the flash pins are off limits. GPIO34..=39 are
-        // input-only, which the pin map cannot express as a range and a port
-        // to this part has to handle separately.
-        &[(6, 11, "the SPI flash this firmware executes from")]
+        // No USB peripheral — this part is reached over UART0, so that pair is
+        // as unavailable as the flash. GPIO34..=39 are additionally input-only.
+        &[
+            (6, 11, "the SPI flash this firmware executes from"),
+            (1, 1, "UART0 TX, the link the probe is reached over"),
+            (3, 3, "UART0 RX, the link the probe is reached over"),
+            (34, 39, "an input-only pad, which cannot drive a signal"),
+        ]
     }
+}
+
+/// Default pin map for this part: SWDIO, SWCLK, RESET, UART_TX, UART_RX.
+///
+/// Not a preference — a set of constraints. A default must avoid the flash
+/// pins, the pins the host link occupies, and above all the *strapping* pins,
+/// which are sampled at reset: a target holding one of those at the wrong
+/// level stops the probe booting at all, and the symptom is a board that
+/// silently drops into ROM download mode rather than an error.
+///
+/// That is not hypothetical. The C3 default puts SWCLK on GPIO2, which is a
+/// strapping pin, and a target holding it low costs an afternoon. It is kept
+/// there because it is what the deployed boards are wired to; a fresh board
+/// should override it. The original ESP32 has more strapping pins and a UART
+/// host link occupying GPIO1/GPIO3, so its default avoids all of them.
+pub const DEFAULT_PINS: [i32; 5] = default_pins();
+
+const fn default_pins() -> [i32; 5] {
+    #[cfg(any(esp32c3, esp32c6, esp32h2, not(target_os = "espidf")))]
+    {
+        // GPIO2 is a strapping pin; see above.
+        [1, 2, 21, 3, 4]
+    }
+    #[cfg(esp32)]
+    {
+        // Avoids GPIO0/2/5/12/15 (strapping), GPIO6..=11 (flash) and
+        // GPIO1/GPIO3 (UART0, which is the host link on this part).
+        [21, 22, 23, 17, 16]
+    }
+    #[cfg(any(esp32s2, esp32s3))]
+    {
+        // Avoids GPIO0/45/46 (strapping), the flash bank, and GPIO19/20 (USB).
+        [4, 5, 6, 17, 18]
+    }
+}
+
+/// Whether the part is reached by USB Serial/JTAG rather than a UART bridge.
+///
+/// The original ESP32 has no USB peripheral at all, so its host link is UART0
+/// and the console cannot share it.
+pub const HAS_USB_SERIAL_JTAG: bool = !cfg!(esp32);
+
+/// GPIO-matrix signal indices for the SPI peripheral that clocks the wire.
+///
+/// The peripheral is "GPSPI2" on the newer parts and "HSPI" on the original
+/// ESP32, and `esp-idf-sys` names its signals accordingly — so these cannot be
+/// one `use` shared by every part. Clock, data-out and data-in, in that order.
+///
+/// Data-out and data-in are both routed to the SWDIO pad: SWD is half duplex
+/// on one wire, and the peripheral drives and samples the same pad.
+#[cfg(target_os = "espidf")]
+pub mod signals {
+    #[cfg(any(esp32c3, esp32c6, esp32h2, esp32s2, esp32s3))]
+    pub use esp_idf_svc::sys::{
+        FSPICLK_OUT_IDX as SPI_CLK_OUT, FSPID_OUT_IDX as SPI_D_OUT, FSPIQ_IN_IDX as SPI_Q_IN,
+    };
+    #[cfg(esp32)]
+    pub use esp_idf_svc::sys::{
+        HSPICLK_OUT_IDX as SPI_CLK_OUT, HSPID_OUT_IDX as SPI_D_OUT, HSPIQ_IN_IDX as SPI_Q_IN,
+    };
+
+    // The peripheral-module handle that gates the SPI block's clock. Named
+    // for the block: "SPI2" on the newer parts, "HSPI" on the original ESP32.
+    #[cfg(esp32)]
+    pub use esp_idf_svc::sys::periph_module_t_PERIPH_HSPI_MODULE as SPI_MODULE;
+    #[cfg(any(esp32c3, esp32c6, esp32h2, esp32s2, esp32s3))]
+    pub use esp_idf_svc::sys::periph_module_t_PERIPH_SPI2_MODULE as SPI_MODULE;
+
+    /// Dedicated-GPIO input channels, where the part has them. The original
+    /// ESP32 does not, and its pad layer samples the GPIO input register
+    /// instead — see `crate::pads`.
+    #[cfg(any(esp32c3, esp32c6, esp32h2))]
+    pub use esp_idf_svc::sys::{
+        CPU_GPIO_IN0_IDX as DEDICATED_IN0, CPU_GPIO_IN1_IDX as DEDICATED_IN1,
+    };
 }
 
 /// Whether the part has the CPU's dedicated-GPIO peripheral.

@@ -1,0 +1,5 @@
+# The C3 is reached over its USB Serial/JTAG peripheral, and the console shares
+# it happily: the bridge is framed and the console is line-based, and they are
+# separate endpoints of the same device.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_UART_DEFAULT=n

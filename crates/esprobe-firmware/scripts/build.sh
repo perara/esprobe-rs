@@ -53,5 +53,29 @@ if [[ -z "${LIBCLANG_PATH:-}" ]] && command -v clang >/dev/null; then
     fi
 fi
 
+# Which part to build for. The C3 is the default because it is what the
+# deployed boards are; anything else needs its target triple, its sdkconfig
+# layer and — for the Xtensa parts — a different toolchain, and getting one of
+# those three wrong produces a firmware that flashes and then does nothing.
+MCU="${MCU:-esp32c3}"
+case "${MCU}" in
+    esp32c3) target="riscv32imc-esp-espidf"; toolchain="+nightly" ;;
+    esp32c6|esp32h2) target="riscv32imac-esp-espidf"; toolchain="+nightly" ;;
+    esp32) target="xtensa-esp32-espidf"; toolchain="+esp" ;;
+    esp32s2) target="xtensa-esp32s2-espidf"; toolchain="+esp" ;;
+    esp32s3) target="xtensa-esp32s3-espidf"; toolchain="+esp" ;;
+    *) echo "unknown MCU '${MCU}'; see chip.rs for the parts with a register map" >&2; exit 2 ;;
+esac
+
+# The Xtensa parts need espup's toolchain, which is not on PATH by default.
+if [[ "${toolchain}" == "+esp" && -f "${HOME}/export-esp.sh" ]]; then
+    # shellcheck disable=SC1091
+    source "${HOME}/export-esp.sh"
+fi
+
+export MCU
+export ESP_IDF_SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.${MCU}"
+
 cd "${firmware_dir}"
-cargo build --release
+echo "building for ${MCU} (${target})" >&2
+cargo "${toolchain}" build --release --target "${target}"

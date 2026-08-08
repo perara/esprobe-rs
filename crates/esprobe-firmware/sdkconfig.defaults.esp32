@@ -1,0 +1,6 @@
+# The original ESP32 has no USB peripheral, so UART0 is the host link and the
+# bridge owns it outright. The console must therefore go nowhere: a log line
+# emitted mid-frame is a CRC failure the host can only recover from by timing
+# out, and it would happen exactly when something interesting was being logged.
+CONFIG_ESP_CONSOLE_NONE=y
+CONFIG_ESP_CONSOLE_UART_DEFAULT=n

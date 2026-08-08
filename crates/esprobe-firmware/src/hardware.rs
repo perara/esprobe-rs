@@ -13,10 +13,12 @@
 
 use esp_idf_svc::hal::delay::Ets;
 use esp_idf_svc::hal::gpio::{AnyIOPin, DriveStrength, InputOutput, Pin, PinDriver, Pull};
-use esp_idf_svc::sys::{
-    CPU_GPIO_IN0_IDX, CPU_GPIO_IN1_IDX, CPU_GPIO_OUT0_IDX, CPU_GPIO_OUT1_IDX, FSPICLK_OUT_IDX,
-    FSPID_OUT_IDX, FSPIQ_IN_IDX, esp_rom_gpio_connect_in_signal,
-};
+use esp_idf_svc::sys::esp_rom_gpio_connect_in_signal;
+
+use crate::chip::signals::{SPI_CLK_OUT, SPI_D_OUT, SPI_Q_IN};
+
+/// The matrix's "this pad is plain GPIO" selection.
+const SIG_GPIO_OUT_IDX: u32 = 128;
 
 use crate::spi_clock::DEFAULT_CLOCK_HZ;
 use crate::swd::SwdIo;
@@ -67,27 +69,6 @@ fn route_output(pin: u32, signal: u32) {
 /// Enables the CPU's cycle counter.
 ///
 /// The ESP32-C3 core has no standard `mcycle`; it exposes Espressif's own
-/// performance counter instead (`SOC_CPU_HAS_CSR_PC`), and reading `mcycle`
-/// here is an illegal instruction that takes the whole firmware down.
-fn enable_cycle_counter() {
-    // SAFETY: 0x7e0 selects the counted event and 0x7e1 runs the counter.
-    unsafe {
-        core::arch::asm!(
-            "csrw 0x7e0, {cycles}",
-            "csrw 0x7e1, {enable}",
-            cycles = in(reg) 1u32,
-            enable = in(reg) 1u32,
-        )
-    };
-}
-
-/// Reads the CPU cycle counter for sub-microsecond bit-bang timing.
-pub fn cpu_cycles() -> u32 {
-    let value: u32;
-    // SAFETY: 0x7e2 is the machine-mode performance counter enabled above.
-    unsafe { core::arch::asm!("csrr {value}, 0x7e2", value = out(reg) value) };
-    value
-}
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Driver {
@@ -135,7 +116,7 @@ impl<'d> EspSwdIo<'d> {
         swdio.set_drive_strength(DriveStrength::I5mA)?;
         swclk.set_drive_strength(DriveStrength::I5mA)?;
 
-        enable_cycle_counter();
+        crate::cycles::enable();
         let mut this = Self {
             _swdio: swdio,
             _swclk: swclk,
@@ -175,12 +156,12 @@ impl<'d> EspSwdIo<'d> {
         self.pads = ChipPads::new(swdio_pin as i32, swclk_pin as i32);
 
         // Inputs feed both engines at once: a pad's level can fan out to any
-        // number of peripheral input signals.
-        // SAFETY: both pins are owned by this type for its whole lifetime.
+        // number of peripheral input signals, so the SPI engine's input and
+        // the pad layer's coexist on the same pad.
+        self.pads.bind(swdio_pin, swclk_pin, route_output);
+        // SAFETY: the pin is owned by this type for its whole lifetime.
         unsafe {
-            esp_rom_gpio_connect_in_signal(swdio_pin, CPU_GPIO_IN0_IDX, false);
-            esp_rom_gpio_connect_in_signal(swclk_pin, CPU_GPIO_IN1_IDX, false);
-            esp_rom_gpio_connect_in_signal(swdio_pin, FSPIQ_IN_IDX, false);
+            esp_rom_gpio_connect_in_signal(swdio_pin, SPI_Q_IN, false);
         }
         // Force the routing write even when the engine is already selected:
         // the pads underneath it may have just changed.
@@ -242,11 +223,11 @@ impl<'d> EspSwdIo<'d> {
         const ROUNDS: u32 = 4;
         const BITS_PER_ROUND: u8 = 64;
         self.set_output_enable(0);
-        let start = cpu_cycles();
+        let start = crate::cycles::read();
         for _ in 0..ROUNDS {
             self.bit_bang_read_bits(BITS_PER_ROUND);
         }
-        let elapsed = cpu_cycles().wrapping_sub(start);
+        let elapsed = crate::cycles::read().wrapping_sub(start);
         let bits = ROUNDS * u32::from(BITS_PER_ROUND);
         CPU_FREQ_HZ / (elapsed / bits).max(1)
     }
@@ -298,15 +279,23 @@ impl<'d> EspSwdIo<'d> {
                 // GPSPI2 idles SWCLK low; match that before the handover so the
                 // pad holds one level right across it.
                 self.pads.latch(SWCLK_CHANNEL, false);
-                route_output(self.swdio_pin, FSPID_OUT_IDX);
-                route_output(self.swclk_pin, FSPICLK_OUT_IDX);
+                route_output(self.swdio_pin, SPI_D_OUT);
+                route_output(self.swclk_pin, SPI_CLK_OUT);
             }
             Driver::DedicatedGpio => {
                 let levels = self.pads.levels();
                 self.pads.latch(SWDIO_CHANNEL, levels & SWDIO_CHANNEL != 0);
                 self.pads.latch(SWCLK_CHANNEL, levels & SWCLK_CHANNEL != 0);
-                route_output(self.swdio_pin, CPU_GPIO_OUT0_IDX);
-                route_output(self.swclk_pin, CPU_GPIO_OUT1_IDX);
+                // A part whose pads are plain GPIO has no peripheral signal to
+                // route here: the GPIO output register already drives them, and
+                // pointing the matrix elsewhere would take the pad away.
+                if let Some((swdio_signal, swclk_signal)) = self.pads.output_signals() {
+                    route_output(self.swdio_pin, swdio_signal);
+                    route_output(self.swclk_pin, swclk_signal);
+                } else {
+                    route_output(self.swdio_pin, SIG_GPIO_OUT_IDX);
+                    route_output(self.swclk_pin, SIG_GPIO_OUT_IDX);
+                }
             }
         }
         self.driver = driver;
@@ -365,8 +354,8 @@ impl<'d> EspSwdIo<'d> {
         if cycles <= MIN_DELAY_CYCLES {
             return;
         }
-        let start = cpu_cycles();
-        while cpu_cycles().wrapping_sub(start) < cycles {}
+        let start = crate::cycles::read();
+        while crate::cycles::read().wrapping_sub(start) < cycles {}
     }
 }
 
@@ -538,12 +527,9 @@ impl SwdIo for EspSwdIo<'_> {
 
     fn release(&mut self) {
         self.set_output_enable(0);
-        // Clear the dedicated-GPIO enable too, so neither path can drive a
-        // line while the bridge believes the target is released.
-        // SAFETY: 0x803 is CSR_GPIO_OEN_USER on ESP32-C3.
-        unsafe {
-            core::arch::asm!("csrrc zero, 0x803, {mask}", mask = in(reg) SWDIO_CHANNEL | SWCLK_CHANNEL)
-        };
+        // Clear the pad layer's own output enable too, so neither path can
+        // drive a line while the bridge believes the target is released.
+        self.pads.release(SWDIO_CHANNEL | SWCLK_CHANNEL);
         self.select_driver(Driver::DedicatedGpio);
         // Preload high so the next enabled transition does not start from a
         // level that was only ever an artefact of the released bus.

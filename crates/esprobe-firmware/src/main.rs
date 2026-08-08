@@ -45,7 +45,8 @@ mod app {
     };
     use esprobe_firmware::{pinmap, wifi_credentials};
 
-    use esprobe_firmware::hardware::{Engine, EspSwdIo, cpu_cycles};
+    use esprobe_firmware::cycles::read as cpu_cycles;
+    use esprobe_firmware::hardware::{Engine, EspSwdIo};
 
     // Build-time credentials are a convenience for a bench that always joins
     // the same network, not a requirement: an image with none still builds,
@@ -1151,7 +1152,7 @@ mod app {
             bridge_attached: false,
             reset_held: false,
         }));
-        spawn_usb_bridge(hub.clone())?;
+        spawn_host_bridge(hub.clone())?;
 
         let mut wifi = BlockingWifi::wrap(
             EspWifi::new(peripherals.modem, sys_loop.clone(), Some(nvs))?,
@@ -1297,6 +1298,109 @@ mod app {
         }
     }
 
+    /// Brings up the host link and serves the bridge on it.
+    ///
+    /// Which link that is depends on the part: USB Serial/JTAG where there is
+    /// one, and UART0 where there is not. `serve_bridge` is generic over the
+    /// stream, so only the setup differs.
+    fn spawn_host_bridge(hub: Arc<Mutex<Hub>>) -> Result<()> {
+        #[cfg(esp32)]
+        {
+            // No USB peripheral on this part. UART0 is the link, and the
+            // console is configured off in its sdkconfig so that log output
+            // cannot interleave with framed bridge traffic — a stray line of
+            // text mid-frame is a CRC failure the host has to time out on.
+            spawn_uart_bridge(hub)
+        }
+        #[cfg(not(esp32))]
+        {
+            spawn_usb_bridge(hub)
+        }
+    }
+
+    #[cfg(esp32)]
+    fn spawn_uart_bridge(hub: Arc<Mutex<Hub>>) -> Result<()> {
+        use esp_idf_svc::sys::{
+            uart_config_t, uart_driver_install, uart_param_config, uart_port_t_UART_NUM_0,
+        };
+        // The bridge's own framing carries the integrity check, so the link
+        // only has to be fast and 8N1. 921600 is what a CP2102 sustains
+        // comfortably; the transport is the limit on this part either way.
+        let config = uart_config_t {
+            baud_rate: 921_600,
+            data_bits: esp_idf_svc::sys::uart_word_length_t_UART_DATA_8_BITS,
+            parity: esp_idf_svc::sys::uart_parity_t_UART_PARITY_DISABLE,
+            stop_bits: esp_idf_svc::sys::uart_stop_bits_t_UART_STOP_BITS_1,
+            flow_ctrl: esp_idf_svc::sys::uart_hw_flowcontrol_t_UART_HW_FLOWCTRL_DISABLE,
+            ..Default::default()
+        };
+        // SAFETY: UART0 is owned by this bridge for the life of the firmware,
+        // and `config` stays valid for the duration of the call.
+        unsafe {
+            esp_idf_svc::sys::esp!(uart_param_config(uart_port_t_UART_NUM_0, &config))?;
+            esp_idf_svc::sys::esp!(uart_driver_install(
+                uart_port_t_UART_NUM_0,
+                4096,
+                3 * (BRIDGE_MAX_FRAME as i32 + 2),
+                0,
+                core::ptr::null_mut(),
+                0,
+            ))?;
+        }
+        thread::Builder::new()
+            .name("uart-dap-bridge".into())
+            .stack_size(48 * 1024)
+            .spawn(move || {
+                let mut link = UartLink;
+                loop {
+                    serve_bridge(&hub, &mut link);
+                }
+            })?;
+        Ok(())
+    }
+
+    /// UART0 as a byte stream, for parts with no USB Serial/JTAG.
+    #[cfg(esp32)]
+    struct UartLink;
+
+    #[cfg(esp32)]
+    impl std::io::Read for UartLink {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            // SAFETY: `buffer` is writable for its length and this task is the
+            // driver's only reader.
+            let read = unsafe {
+                esp_idf_svc::sys::uart_read_bytes(
+                    esp_idf_svc::sys::uart_port_t_UART_NUM_0,
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len() as u32,
+                    10,
+                )
+            };
+            Ok(read.max(0) as usize)
+        }
+    }
+
+    #[cfg(esp32)]
+    impl std::io::Write for UartLink {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            // SAFETY: `buffer` stays readable for its length; this task is the
+            // driver's only writer.
+            unsafe {
+                esp_idf_svc::sys::uart_write_bytes(
+                    esp_idf_svc::sys::uart_port_t_UART_NUM_0,
+                    buffer.as_ptr().cast(),
+                    buffer.len(),
+                );
+            }
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(not(esp32))]
     fn spawn_usb_bridge(hub: Arc<Mutex<Hub>>) -> Result<()> {
         let mut config = esp_idf_svc::sys::usb_serial_jtag_driver_config_t {
             // Two full responses must fit, so the wire engine can start the
@@ -1324,8 +1428,10 @@ mod app {
     }
 
     /// The bridge protocol over the ESP32-C3's USB Serial/JTAG endpoint.
+    #[cfg(not(esp32))]
     struct UsbSerialLink;
 
+    #[cfg(not(esp32))]
     impl std::io::Read for UsbSerialLink {
         fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
             // SAFETY: `buffer` is writable for its length, and the bridge task
@@ -1341,6 +1447,7 @@ mod app {
         }
     }
 
+    #[cfg(not(esp32))]
     impl std::io::Write for UsbSerialLink {
         fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
             usb_write_all(buffer);
@@ -1455,6 +1562,7 @@ mod app {
         Ok(())
     }
 
+    #[cfg(not(esp32))]
     fn usb_write_all(mut bytes: &[u8]) {
         while !bytes.is_empty() {
             // SAFETY: `bytes` remains readable for its reported length. This

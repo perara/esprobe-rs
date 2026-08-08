@@ -10,6 +10,10 @@ rustflags = ["--cfg", "espidf_time64"]
 build-std = ["std", "panic_abort"]
 
 [env]
+# Layered: the chip-neutral file first, then this part's. Cargo does not expand
+# variables here, so the default names the C3 outright and a build for another
+# part overrides both of these — see `scripts/build.sh`.
+ESP_IDF_SDKCONFIG_DEFAULTS = "sdkconfig.defaults;sdkconfig.defaults.esp32c3"
 MCU = "esp32c3"
 ESP_IDF_VERSION = "v5.4.3"
 ESP_IDF_TOOLS_INSTALL_DIR = "global"

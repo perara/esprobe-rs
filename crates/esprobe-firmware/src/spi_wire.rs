@@ -16,7 +16,9 @@
 //! Register offsets and field positions are from the ESP32-C3 TRM, mirrored by
 //! `components/soc/esp32c3/register/soc/spi_reg.h` in ESP-IDF v5.4.3.
 
-use esp_idf_svc::sys::{periph_module_enable, periph_module_t_PERIPH_SPI2_MODULE};
+use esp_idf_svc::sys::periph_module_enable;
+
+use crate::chip::signals::SPI_MODULE;
 
 use crate::spi_clock::{self, SOURCE_CLOCK_HZ};
 
@@ -54,14 +56,6 @@ pub const MAX_BURST_BITS: u8 = 64;
 /// Iterations of a register poll before a transfer is abandoned. A 64-bit
 /// field at the slowest supported clock takes well under a millisecond.
 const SPIN_LIMIT: u32 = 2_000_000;
-
-/// Reads the CPU cycle counter enabled by the pad driver at start-up.
-fn cpu_cycles() -> u32 {
-    let value: u32;
-    // SAFETY: 0x7e2 is the ESP32-C3 machine performance counter.
-    unsafe { core::arch::asm!("csrr {value}, 0x7e2", value = out(reg) value) };
-    value
-}
 
 fn write_reg(offset: u32, value: u32) {
     // SAFETY: `offset` names a GPSPI2 register this driver owns exclusively.
@@ -101,7 +95,7 @@ impl SpiWire {
     /// never drives a line the caller has not enabled.
     pub fn new(clock_hz: u32) -> Self {
         // SAFETY: SPI2 is handed to no other driver in this firmware.
-        unsafe { periph_module_enable(periph_module_t_PERIPH_SPI2_MODULE) };
+        unsafe { periph_module_enable(SPI_MODULE) };
 
         write_reg(
             SPI_CLK_GATE,
@@ -238,7 +232,7 @@ impl SpiWire {
 
     fn run(&mut self, phase: Phase, count: u8) {
         debug_assert!(count <= MAX_BURST_BITS);
-        let started = cpu_cycles();
+        let started = crate::cycles::read();
         let dlen = u32::from(count) - 1;
         if dlen != self.programmed_dlen {
             write_reg(SPI_MS_DLEN, dlen);
@@ -269,7 +263,7 @@ impl SpiWire {
         Self::wait_for(CMD_USR);
         self.run_cycles = self
             .run_cycles
-            .wrapping_add(cpu_cycles().wrapping_sub(started));
+            .wrapping_add(crate::cycles::read().wrapping_sub(started));
         self.run_count = self.run_count.wrapping_add(1);
     }
 }

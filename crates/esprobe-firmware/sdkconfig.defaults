@@ -1,5 +1,5 @@
-CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
-CONFIG_ESP_CONSOLE_UART_DEFAULT=n
+# Chip-neutral. Per-part settings live in sdkconfig.defaults.<mcu>, which
+# esp-idf-sys layers on top of this one.
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024

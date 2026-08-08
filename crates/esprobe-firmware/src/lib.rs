@@ -1,3 +1,4 @@
+#![cfg_attr(target_arch = "xtensa", feature(asm_experimental_arch))]
 //! Hardware-neutral contracts for the ESP32 SWD bridge.
 //!
 //! This crate is the probe and nothing else: a debug port on two pins, a reset
@@ -10,6 +11,8 @@
 //! own pin assignment. Nothing here needs to know it exists.
 
 pub mod chip;
+#[cfg(target_os = "espidf")]
+pub mod cycles;
 pub mod safety;
 pub mod swd;
 
@@ -70,20 +73,20 @@ pub mod pinmap {
     }
 
     /// The debug port itself. These two are the whole probe.
-    pub const SWDIO: i32 = pin(option_env!("PIN_SWDIO"), 1);
-    pub const SWCLK: i32 = pin(option_env!("PIN_SWCLK"), 2);
+    pub const SWDIO: i32 = pin(option_env!("PIN_SWDIO"), crate::chip::DEFAULT_PINS[0]);
+    pub const SWCLK: i32 = pin(option_env!("PIN_SWCLK"), crate::chip::DEFAULT_PINS[1]);
     /// Driven low to hold the target in reset, released to its pull-up
     /// otherwise. Never driven high: the target's own pull-up sets the level,
     /// so a board whose target is unpowered is not back-fed through this pin.
-    pub const RESET: i32 = pin(option_env!("PIN_RESET"), 21);
+    pub const RESET: i32 = pin(option_env!("PIN_RESET"), crate::chip::DEFAULT_PINS[2]);
 
     /// An optional UART to the target, for a serial console or a vendor's ROM
     /// bootloader. `TX` runs to the target's receiver and `RX` from its
     /// transmitter — the direction is not a naming preference, and getting it
     /// backwards puts two transmitters on one wire, which is silent rather
     /// than noisy and is correspondingly hard to find.
-    pub const UART_TX: i32 = pin(option_env!("PIN_UART_TX"), 3);
-    pub const UART_RX: i32 = pin(option_env!("PIN_UART_RX"), 4);
+    pub const UART_TX: i32 = pin(option_env!("PIN_UART_TX"), crate::chip::DEFAULT_PINS[3]);
+    pub const UART_RX: i32 = pin(option_env!("PIN_UART_RX"), crate::chip::DEFAULT_PINS[4]);
 
     /// Every pin this firmware claims, for reclaiming them from their reset
     /// functions at start-up.

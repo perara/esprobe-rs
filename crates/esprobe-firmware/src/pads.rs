@@ -47,6 +47,29 @@ pub trait Pads {
 
     /// Samples both pads.
     fn levels(&self) -> u32;
+
+    /// Binds the pads to this layer.
+    ///
+    /// On a part with a dedicated-GPIO peripheral the pads must be routed to
+    /// its channels through the GPIO matrix; on a part without, the pads are
+    /// already ordinary GPIO and there is nothing to route. Called whenever the
+    /// pin map changes, so it must be idempotent.
+    ///
+    /// `route_output` is the caller's, because selecting *which* driver owns
+    /// the output at any moment is the engine's decision, not the pad layer's.
+    fn bind(&self, swdio_pin: u32, swclk_pin: u32, route_output: impl Fn(u32, u32));
+
+    /// The output signal indices this layer drives the pads with, if it has
+    /// any of its own. `None` on a part whose pads are plain GPIO.
+    fn output_signals(&self) -> Option<(u32, u32)>;
+
+    /// Stops this layer driving the named channels.
+    ///
+    /// Distinct from clearing the GPIO output enable, which the caller does
+    /// separately: on a part with a dedicated-GPIO peripheral the two are
+    /// different switches, and leaving this one on means the pad is still
+    /// driven from a path the caller thinks it released.
+    fn release(&self, channels: u32);
 }
 
 /// The dedicated-GPIO peripheral, through RISC-V CSRs.
@@ -89,6 +112,30 @@ impl Pads for DedicatedGpio {
         // SAFETY: 0x804 is CSR_GPIO_IN_USER, a read with no side effects.
         unsafe { core::arch::asm!("csrr {value}, 0x804", value = out(reg) value) };
         value
+    }
+
+    fn release(&self, channels: u32) {
+        // SAFETY: 0x803 is CSR_GPIO_OEN_USER; the clear form touches only the
+        // channels named.
+        unsafe { core::arch::asm!("csrrc zero, 0x803, {mask}", mask = in(reg) channels) };
+    }
+
+    fn bind(&self, swdio_pin: u32, swclk_pin: u32, _route_output: impl Fn(u32, u32)) {
+        use crate::chip::signals::{DEDICATED_IN0, DEDICATED_IN1};
+        // Inputs fan out: a pad's level can feed any number of peripheral
+        // input signals at once, so binding these does not take the pad away
+        // from the SPI engine's own input.
+        //
+        // SAFETY: both pins are owned by the caller for its whole lifetime.
+        unsafe {
+            esp_idf_svc::sys::esp_rom_gpio_connect_in_signal(swdio_pin, DEDICATED_IN0, false);
+            esp_idf_svc::sys::esp_rom_gpio_connect_in_signal(swclk_pin, DEDICATED_IN1, false);
+        }
+    }
+
+    fn output_signals(&self) -> Option<(u32, u32)> {
+        use esp_idf_svc::sys::{CPU_GPIO_OUT0_IDX, CPU_GPIO_OUT1_IDX};
+        Some((CPU_GPIO_OUT0_IDX, CPU_GPIO_OUT1_IDX))
     }
 }
 
@@ -180,6 +227,21 @@ impl Pads for MatrixGpio {
             levels |= SWCLK;
         }
         levels
+    }
+
+    fn release(&self, _channels: u32) {
+        // Nothing to do: this layer drives through the ordinary output enable,
+        // which the caller clears itself. There is no second switch to undo.
+    }
+
+    fn bind(&self, _swdio_pin: u32, _swclk_pin: u32, _route_output: impl Fn(u32, u32)) {
+        // The pads are plain GPIO already. Nothing to route.
+    }
+
+    fn output_signals(&self) -> Option<(u32, u32)> {
+        // No peripheral drives these pads on this path; the GPIO output
+        // register does, so the matrix stays on its plain-GPIO function.
+        None
     }
 }
 
