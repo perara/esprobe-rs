@@ -80,6 +80,63 @@ This crate used to carry one such board itself: a four-way analog switch, a
 motor driver, a control page, and a vendor's flash programmer. It does not any
 more, and the pin map above is the whole of what it claims.
 
+## Which part
+
+The firmware runs on more than one ESP. `MCU` picks it, and `scripts/build.sh`
+derives the target triple, the Rust toolchain and the sdkconfig layer from it
+together — getting one of those three wrong produces a firmware that flashes
+and then does nothing.
+
+```bash
+./scripts/build.sh              # ESP32-C3, the default
+MCU=esp32 ./scripts/build.sh    # original ESP32 (Xtensa; needs espup)
+```
+
+| part | verified |
+| --- | --- |
+| `esp32c3` | **on hardware** |
+| `esp32` | builds; not yet flashed, see below |
+| `esp32s2`, `esp32s3`, `esp32c6`, `esp32h2` | register maps written, never built |
+
+What differs between parts lives in `src/chip.rs` — two register bases, the
+GPIO ceiling, the reserved pads, the default pin map — and in the two modules
+that contain every line of assembly, `src/pads.rs` and `src/cycles.rs`. Adding
+a part is a block in each, not an edit to the drivers.
+
+The Xtensa parts need espup's toolchain and its environment:
+
+```bash
+espup install --targets esp32
+. ~/export-esp.sh
+```
+
+### The original ESP32 differs in two ways worth knowing
+
+It has **no USB Serial/JTAG peripheral**, so the bridge runs on UART0 at
+921600 and the console is switched off in `sdkconfig.defaults.esp32`. A log
+line emitted mid-frame is a CRC failure the host can only escape by timing out,
+so the two cannot share the port.
+
+It has **more strapping pins**, and its default pin map avoids all of them:
+SWDIO on GPIO21, SWCLK on GPIO22, reset on GPIO23. Do not move those onto
+GPIO0, 2, 5, 12 or 15.
+
+### A target on GPIO2 stops the board being flashed
+
+Boot mode is strapped from GPIO0 and GPIO2 together, sampled at reset:
+
+| GPIO0 | GPIO2 | mode |
+| --- | --- | --- |
+| 1 | x | `SPI_FAST_FLASH_BOOT` (0x1b) — normal run |
+| 0 | 0 | download — what flashing needs |
+| 0 | 1 | `HSPI_FLASH_BOOT` (0x0b) — flashing fails here |
+
+If `espflash` reports "Failed to connect" and a serial monitor shows
+`boot:0xb`, the auto-reset is working and something is holding GPIO2 high —
+most likely a target wired to it. Disconnect that wire, flash, then wire the
+target to the pins above instead. This is the same hazard as the C3's SWCLK
+default, which is also a strapping pin.
+
 ## Build and flash
 
 Install the Rust-on-ESP prerequisites (`ldproxy`, `espflash`, and a recent
