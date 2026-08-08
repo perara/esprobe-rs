@@ -16,9 +16,15 @@
 //!
 //! # Adding a part
 //!
-//! Three numbers and a pin ceiling, taken from that part's technical reference
-//! manual: the GPIO block's base, GPSPI2's base, and the highest GPIO the
-//! package actually brings out. If the part has no dedicated-GPIO peripheral,
+//! Three numbers, and take them from ESP-IDF rather than from a datasheet or
+//! from memory — `components/soc/<chip>/register/soc/reg_base.h` for
+//! `DR_REG_GPIO_BASE` and `DR_REG_SPI2_BASE`, and `soc_caps.h` for
+//! `SOC_GPIO_PIN_COUNT`, which is one more than the ceiling here.
+//!
+//! Three of the six were wrong when first written from documentation: both of
+//! the C6's and H2's SPI bases, and both of the S2's, which was assumed to
+//! share the S3's map on the strength of the name. None of that is visible
+//! without either the headers or the silicon. If the part has no dedicated-GPIO peripheral,
 //! see [`HAS_DEDICATED_GPIO`] — the bit-bang fallback depends on it.
 
 /// Base of the GPIO peripheral's register block.
@@ -35,6 +41,10 @@ pub const MAX_GPIO: i32 = bases().2;
 /// Driving one of these does not produce a signal, it produces a brick: the
 /// SPI flash the firmware is executing from, or the USB pair it is being
 /// talked to over. Checked against the pin map by a host test.
+///
+/// The flash pads come from ESP-IDF's `SPI_*_GPIO_NUM`, not from a datasheet
+/// reading — the C6's are 24..=26 and 28..=30, with 27 free between them,
+/// which no plausible guess produces.
 pub const RESERVED: &[(i32, i32, &str)] = reserved();
 
 const fn reserved() -> &'static [(i32, i32, &'static str)] {
@@ -48,28 +58,29 @@ const fn reserved() -> &'static [(i32, i32, &'static str)] {
     #[cfg(esp32c6)]
     {
         &[
-            (24, 30, "the SPI flash this firmware executes from"),
+            (24, 26, "the SPI flash this firmware executes from"),
+            (28, 30, "the SPI flash this firmware executes from"),
             (12, 13, "the USB serial/JTAG pair the probe is reached over"),
         ]
     }
     #[cfg(esp32h2)]
     {
         &[
-            (15, 21, "the SPI flash this firmware executes from"),
+            (15, 20, "the SPI flash this firmware executes from"),
             (26, 27, "the USB serial/JTAG pair the probe is reached over"),
         ]
     }
     #[cfg(esp32s3)]
     {
         &[
-            (26, 32, "the SPI flash this firmware executes from"),
+            (27, 32, "the SPI flash this firmware executes from"),
             (19, 20, "the USB serial/JTAG pair the probe is reached over"),
         ]
     }
     #[cfg(esp32s2)]
     {
         &[
-            (26, 32, "the SPI flash this firmware executes from"),
+            (27, 32, "the SPI flash this firmware executes from"),
             (19, 20, "the USB pair the probe is reached over"),
         ]
     }
@@ -188,23 +199,26 @@ const fn bases() -> (u32, u32, i32) {
     }
     #[cfg(esp32c6)]
     {
-        // ESP32-C6 TRM: the peripheral map moved wholesale from the C3's.
-        (0x6009_1000, 0x6008_3000, 30)
+        // The peripheral map moved wholesale from the C3's.
+        (0x6009_1000, 0x6008_1000, 30)
     }
     #[cfg(esp32h2)]
     {
-        (0x6009_1000, 0x6008_3000, 27)
+        (0x6009_1000, 0x6008_1000, 27)
     }
     #[cfg(esp32s3)]
     {
-        // S3 and S2 keep the C3's 0x600x_xxxx arrangement for these two blocks,
-        // which is why they are the cheapest parts to add after the C3 — the
-        // toolchain changes, the driver largely does not.
+        // The S3 does keep the C3's arrangement for these two blocks, which
+        // makes it the cheapest part to add after the C3: the toolchain
+        // changes, these do not. The S2 does *not* — see below.
         (0x6000_4000, 0x6002_4000, 48)
     }
     #[cfg(esp32s2)]
     {
-        (0x6000_4000, 0x6002_4000, 46)
+        // The S2 sits in the older 0x3F4x map with the original ESP32, not
+        // with its S3 sibling. Grouping it with the S3 by name is wrong and
+        // was, until these were checked against ESP-IDF's own `reg_base.h`.
+        (0x3F40_4000, 0x3F42_4000, 46)
     }
     #[cfg(esp32)]
     {
