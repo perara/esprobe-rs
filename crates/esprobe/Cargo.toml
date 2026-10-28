@@ -22,14 +22,20 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0"
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.6", features = ["derive"] }
 ctrlc = "3.4"
 esprobe-protocol = { path = "../esprobe-protocol", version = "0.2.0" }
-probe-rs = "0.31"
-serialport = { version = "4.8", default-features = false }
+probe-rs = "0.32"
+serialport = { version = "4.10", default-features = false }
 rpassword = "7.3"
-sha2 = "0.10"
+sha2 = "0.11"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-gdbstub = "0.7"
-gdbstub_arch = "0.3"
+
+# gdbstub is fixed to 0.7.8 in mainstream probe-rs-tools
+# due to regression in 0.7.9. We must do the same as well
+# in order to keep compatibility.
+gdbstub = "=0.7.8"
+# gdbstub_arch > 0.3.2 is incompatible with gdbstub < 0.7.9
+gdbstub_arch = "=0.3.2"
+

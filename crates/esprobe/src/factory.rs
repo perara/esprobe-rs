@@ -14,9 +14,9 @@
 
 use std::net::SocketAddr;
 
-use probe_rs::probe::list::{AllProbesLister, ProbeLister};
+use probe_rs::probe::list::{ProbeListItem, device_node_accessibility};
 use probe_rs::probe::{
-    DebugProbe, DebugProbeError, DebugProbeInfo, DebugProbeSelector, Probe, ProbeCreationError,
+    DebugProbe, DebugProbeError, DebugProbeInfo, DebugProbeSelector, ProbeCreationError,
     ProbeFactory,
 };
 use serialport::{SerialPortType, available_ports};
@@ -125,11 +125,11 @@ impl ProbeFactory for EspBridgeFactory {
             .map_err(|_| DebugProbeError::ProbeCouldNotBeCreated(ProbeCreationError::NotFound))
     }
 
-    fn list_probes(&self) -> Vec<DebugProbeInfo> {
+    fn list_probes(&self) -> Vec<ProbeListItem> {
         let mut probes = Vec::new();
 
         if let Ok(endpoint) = std::env::var(NETWORK_ENV) {
-            probes.push(DebugProbeInfo::new(
+            probes.push(ProbeListItem::accessible(DebugProbeInfo::new(
                 format!("ESP32-C3 SWD bridge ({endpoint})"),
                 ESPRESSIF_VID,
                 USB_SERIAL_JTAG_PID,
@@ -137,7 +137,7 @@ impl ProbeFactory for EspBridgeFactory {
                 &EspBridgeFactory,
                 None,
                 false,
-            ));
+            )));
         }
 
         let accept_any = std::env::var(OVERRIDE_ENV).is_ok();
@@ -159,60 +159,23 @@ impl ProbeFactory for EspBridgeFactory {
             if !accept_any && !looks_right {
                 continue;
             }
-            probes.push(DebugProbeInfo::new(
-                format!("ESP32-C3 SWD bridge ({})", port.port_name),
-                usb.vid,
-                usb.pid,
-                // The port path, not the USB serial: it is what `open` needs,
-                // and every Espressif bridge reports its MAC as the serial.
-                Some(port.port_name.clone()),
-                &EspBridgeFactory,
-                None,
-                false,
-            ));
+            let accessibility = device_node_accessibility(&port.port_name);
+            probes.push(ProbeListItem {
+                info: DebugProbeInfo::new(
+                    format!("ESP32-C3 SWD bridge ({})", port.port_name),
+                    usb.vid,
+                    usb.pid,
+                    // The port path, not the USB serial: it is what `open` needs,
+                    // and every Espressif bridge reports its MAC as the serial.
+                    Some(port.port_name.clone()),
+                    &EspBridgeFactory,
+                    None,
+                    false,
+                ),
+                accessibility,
+            });
         }
         probes
-    }
-}
-
-/// Offers the bridge alongside every probe driver probe-rs ships.
-///
-/// Out-of-tree registration: `AllProbesLister`'s driver table is a private
-/// constant, so a custom lister is the supported way to add one. Delegating to
-/// it rather than replacing it means a J-Link or CMSIS-DAP plugged into the
-/// same machine still works.
-#[derive(Debug)]
-pub struct EspBridgeLister {
-    builtin: AllProbesLister,
-}
-
-impl EspBridgeLister {
-    pub fn new() -> Self {
-        Self {
-            builtin: AllProbesLister::new(),
-        }
-    }
-}
-
-impl Default for EspBridgeLister {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl ProbeLister for EspBridgeLister {
-    fn open(&self, selector: &DebugProbeSelector) -> Result<Probe, DebugProbeError> {
-        match EspBridgeFactory.open(selector) {
-            Ok(probe) => Ok(Probe::from_specific_probe(probe)),
-            // Not ours; let the built-in drivers have it.
-            Err(_) => self.builtin.open(selector),
-        }
-    }
-
-    fn list(&self, selector: Option<&DebugProbeSelector>) -> Vec<DebugProbeInfo> {
-        let mut list = self.builtin.list(selector);
-        list.extend(EspBridgeFactory.list_probes_filtered(selector));
-        list
     }
 }
 

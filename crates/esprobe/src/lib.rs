@@ -8,7 +8,8 @@
 //!
 //! ```no_run
 //! use probe_rs::probe::list::Lister;
-//! let lister = Lister::with_lister(Box::new(esprobe::factory::EspBridgeLister::new()));
+//! esprobe::register_plugin();
+//! let lister = Lister::new();
 //! for probe in lister.list_all() {
 //!     println!("{}", probe.identifier);
 //! }
@@ -33,6 +34,7 @@ use probe_rs::architecture::arm::sequences::ArmDebugSequence;
 use probe_rs::architecture::arm::{
     ArmCommunicationInterface, ArmDebugInterface, ArmError, DapProbe, RawDapAccess, RegisterAddress,
 };
+use probe_rs::plugin::{self, Plugin};
 use probe_rs::probe::{DebugProbe, DebugProbeError, WireProtocol};
 use probe_rs::{CoreStatus, Error as ProbeRsError};
 
@@ -51,6 +53,20 @@ pub enum Engine {
     Hardware,
     /// The CPU drives every edge.
     BitBang,
+}
+
+/// Register `probe-rs` plugin for use in `probe-rs-cli`.
+///
+/// Call this first after including `probe-rs` into your project.
+/// This adds ESP32 probes to the list of known probes of `probe-rs`
+/// and automagically takes care of everything.
+pub fn register_plugin() {
+    plugin::register_plugin(Plugin {
+        image_formats: &[],
+        targets: &[],
+        vendors: &[],
+        probe_drivers: &[&factory::EspBridgeFactory],
+    })
 }
 
 /// Stopping, starting and inspecting the target's core.

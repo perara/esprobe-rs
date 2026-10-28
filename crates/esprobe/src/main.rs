@@ -12,7 +12,10 @@ use clap::{Parser, Subcommand};
 use esprobe_protocol::clock::DEFAULT_CLOCK_HZ;
 use esprobe_protocol::frame::Command;
 use probe_rs::architecture::arm::{RawDapAccess, RegisterAddress};
-use probe_rs::flashing::{DownloadOptions, Format, download_file_with_options};
+use probe_rs::flashing::{
+    BinLoader, BinOptions, DownloadOptions, ElfLoader, HexLoader, ImageLoader,
+    download_file_with_options,
+};
 use probe_rs::probe::list::Lister;
 use probe_rs::probe::{DebugProbe, DebugProbeSelector, WireProtocol};
 use probe_rs::{MemoryInterface, Permissions};
@@ -349,6 +352,7 @@ enum Action {
 }
 
 fn main() -> Result<()> {
+    esprobe::register_plugin();
     let args = Args::parse();
     if args.verbose {
         tracing_subscriber::fmt()
@@ -365,7 +369,7 @@ fn main() -> Result<()> {
     }
     // Listing must not open a link, so it runs before one is chosen.
     if matches!(args.command, Action::ListProbes) {
-        let lister = Lister::with_lister(Box::new(esprobe::factory::EspBridgeLister::new()));
+        let lister = Lister::new();
         let probes = lister.list_all();
         if probes.is_empty() {
             println!("no probes found");
@@ -955,7 +959,7 @@ fn main() -> Result<()> {
         serial_number: Some(link_selector.clone()),
     };
     drop(serial);
-    let lister = Lister::with_lister(Box::new(esprobe::factory::EspBridgeLister::new()));
+    let lister = Lister::new();
     let mut probe = lister
         .open(selector.clone())
         .with_context(|| format!("failed to open the bridge at {link_selector}"))?;
@@ -1032,8 +1036,7 @@ fn main() -> Result<()> {
             gdb::serve(
                 session,
                 move || {
-                    let lister =
-                        Lister::with_lister(Box::new(esprobe::factory::EspBridgeLister::new()));
+                    let lister = Lister::new();
                     let mut probe = lister.open(attach_selector.clone())?;
                     probe.select_protocol(WireProtocol::Swd)?;
                     let session = if attach_under_reset {
@@ -1069,8 +1072,13 @@ fn main() -> Result<()> {
         Action::Flash { image } => {
             let mut options = DownloadOptions::default();
             options.verify = true;
-            download_file_with_options(&mut session, &image, Format::default(), options)
-                .with_context(|| format!("failed to flash {}", image.display()))?;
+            download_file_with_options(
+                &mut session,
+                &image,
+                ElfLoader(Default::default()),
+                options,
+            )
+            .with_context(|| format!("failed to flash {}", image.display()))?;
             session.core(0)?.reset()?;
             println!("flashed={} target={target} verified=true", image.display());
         }
@@ -1102,12 +1110,12 @@ fn main() -> Result<()> {
             let wanted = std::fs::read(&image)
                 .with_context(|| format!("failed to read {}", image.display()))?;
             let format = match image.extension().and_then(|value| value.to_str()) {
-                Some("bin") => Format::Bin(probe_rs::flashing::BinOptions {
+                Some("hex") => Box::new(HexLoader) as Box<dyn ImageLoader>,
+                Some("bin") => Box::new(BinLoader(BinOptions {
                     base_address: Some(address),
                     skip: 0,
-                }),
-                Some("hex") => Format::Hex,
-                _ => Format::default(),
+                })),
+                _ => Box::new(ElfLoader(Default::default())),
             };
 
             // Back up before erasing, always. A device that turns out to be
